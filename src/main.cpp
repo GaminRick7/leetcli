@@ -21,7 +21,7 @@ int main(int argc, char **argv) {
     if (command == "fetch") {
 
         if (argc < 3) {
-            std::cerr << "Usage: leetcli fetch <slug> [--lang=cpp|python|java]\n";
+            std::cerr << "Usage: leetcli fetch <slug> [--lang=cpp|python3|java]\n";
             return 1;
         }
 
@@ -48,7 +48,7 @@ int main(int argc, char **argv) {
 
     if (command == "solve") {
         if (argc < 3) {
-            std::cerr << "Usage: leetcli solve <slug> [--lang=cpp|python|java]\n";
+            std::cerr << "Usage: leetcli solve <slug> [--lang=cpp|python3|java]\n";
             return 1;
         }
         std::string lang_override;
@@ -103,7 +103,7 @@ int main(int argc, char **argv) {
     }
     if (command == "submit") {
         if (argc < 3) {
-            std::cerr << "Usage: leetcli submit <slug> [--lang=cpp|python|java]\n";
+            std::cerr << "Usage: leetcli submit <slug> [--lang=cpp|python3|java]\n";
             return 1;
         }
         std::string slug = argv[2];
@@ -124,7 +124,7 @@ int main(int argc, char **argv) {
     }
     if (command == "run") {
         if (argc < 3) {
-            std::cerr << "Usage: leetcli run <slug> [--lang=cpp|python|java]\n";
+            std::cerr << "Usage: leetcli run <slug> [--lang=cpp|python3|java]\n";
             return 1;
         }
         std::string slug = argv[2];
@@ -147,7 +147,7 @@ int main(int argc, char **argv) {
     }
     if (command == "runtime") {
         if (argc < 3) {
-            std::cerr << "Usage: leetcli runtime <slug> [--lang=cpp|python|java]\n";
+            std::cerr << "Usage: leetcli runtime <slug> [--lang=cpp|python3|java]\n";
             return 1;
         }
         std::string slug = argv[2];
@@ -167,7 +167,7 @@ int main(int argc, char **argv) {
     }
     if (command == "hint") {
         if (argc < 3) {
-            std::cerr << "Usage: leetcli hint <slug> [--lang=cpp|python|java]\n";
+            std::cerr << "Usage: leetcli hint <slug> [--lang=cpp|python3|java]\n";
             return 1;
         }
         std::string slug = argv[2];
@@ -189,7 +189,7 @@ int main(int argc, char **argv) {
         std::cout << "leetcli - LeetCode CLI Tool\n\n"
                   << "Usage:\n"
                   << "  leetcli init                        Initialize the problems directory in your current directory\n"
-                  << "  leetcli fetch <slug> [--lang=...]   Fetch a problem by slug or use 'daily' for the daily question\n"
+                  << "  leetcli fetch <slug> [--lang=...]   Fetch a problem by slug or use 'daily' for the daily question (langs: cpp, python3, java)\n"
                   << "  leetcli solve <slug> [--lang=...]   Open the solution file in your default editor\n"
                   << "  leetcli list                        List all fetched problems\n"
                   << "  leetcli login                       Set your LEETCODE_SESSION and CSRF token\n"

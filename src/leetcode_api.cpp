@@ -247,7 +247,7 @@ namespace leetcli {
         }
 
         // File extension based on lang
-        std::string ext = (preferred_lang == "python") ? ".py" : (preferred_lang == "java") ? ".java" : ".cpp";
+        std::string ext = (preferred_lang == "python3") ? ".py" : (preferred_lang == "java") ? ".java" : ".cpp";
 
 
         // Make safe folder path: problems/{id}. {title}/
@@ -357,7 +357,17 @@ namespace leetcli {
         std::string question_id = json["data"]["question"]["questionId"];
 
         // Step 3: Submit the solution
-        std::string lang = get_preferred_language();
+        std::string ext = get_file_extension(solution_path);
+        std::string lang;
+        if (ext == "cpp") {
+            lang = "cpp";
+        } else if (ext == "py") {
+            lang = "python3";
+        } else if (ext == "java") {
+            lang = "java";
+        } else {
+            lang = get_preferred_language();
+        }
         nlohmann::json payload = {
             {"lang", lang},
             {"question_id", question_id},

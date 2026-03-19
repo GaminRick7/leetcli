@@ -21,14 +21,40 @@
 - 📤 **Submit solutions** directly from the CLI
 - 📂 **Organized project structure** with per-problem folders
 - 🔑 **Session management** for authenticated actions
-## 🔧 Installation
 
-### ⚡ Quick Install (Recommended)
 
-**For macOS and Linux users:**
-```bash
-curl -fsSL https://raw.githubusercontent.com/d3kanesa/leetcli/main/install-leetcli.sh | bash
-```
+### 🐳 Docker (Recommended — No C++ Toolchain Required)
+
+The fastest way to get started. No need to install C++, CMake, or vcpkg.
+
+1. **Pull the image**:
+   ```sh
+   docker pull d3kanesa/leetcli
+   ```
+
+2. **Set up a shell alias** (add to `~/.bashrc` or `~/.zshrc`):
+   ```sh
+   alias leetcli='docker run --rm -it -v "$HOME/.leetcli:/workspace/.leetcli" -v "$(pwd)/problems:/workspace/problems" d3kanesa/leetcli'
+   ```
+   Then reload your shell:
+   ```sh
+   source ~/.zshrc   # or source ~/.bashrc
+   ```
+
+3. **Create a workspace and start using it**:
+   ```sh
+   mkdir ~/leetcode && cd ~/leetcode
+   leetcli init
+   leetcli login
+   leetcli fetch two-sum
+   leetcli list
+   ```
+
+   - **Config** is stored at `~/.leetcli/config.json` on your host
+   - **Problems** are stored in `./problems/` relative to where you run commands
+
+
+> **Note:** `leetcli solve` opens an editor inside the container, which won't work with Docker. Since your solution files are bind-mounted to the host, edit them directly with your local editor instead. Also if you clone the github, you can use the leetcli-docker.sh script to run rather than setting up the alias.
 
 ---
 
@@ -83,7 +109,7 @@ curl -fsSL https://raw.githubusercontent.com/d3kanesa/leetcli/main/install-leetc
 
 6. **Test the installation**:
    ```sh
-   leetcli --help
+   leetcli help
    ```
 
 ---
@@ -167,7 +193,7 @@ leetcli config set-gemini-key <your-gemini-key>
 ## 📚 Usage
 ```sh
 leetcli init                        Initialize the problems directory in your current directory
-leetcli fetch slug [--lang=...]     Fetch a problem by slug or use 'daily' for the daily question
+leetcli fetch slug [--lang=...]     Fetch a problem by slug or use 'daily' for the daily question (langs: cpp, python3, java)
 leetcli solve slug [--lang=...]     Open the solution file in your default editor
 leetcli list                        List all fetched problems
 leetcli login                       Set your LEETCODE_SESSION and CSRF token

@@ -164,6 +164,7 @@ namespace leetcli {
 
     void init_problems_folder() {
         std::filesystem::path home = get_home();
+        std::cout << "home: " << home << "\n";
         std::filesystem::path config_dir = home / ".leetcli";
         std::filesystem::path config_path = config_dir / "config.json";
 
@@ -180,9 +181,9 @@ namespace leetcli {
 
         // Ask for preferred language
         std::string lang;
-        std::cout << "Enter your preferred language (e.g., cpp, python, java): ";
+        std::cout << "Enter your preferred language (e.g., cpp, python3, java): ";
         std::getline(std::cin, lang);
-        if (lang != "python" && lang != "cpp" && lang != "java") {
+        if (lang != "python3" && lang != "cpp" && lang != "java") {
             std::cout << "Language is not supported";
             return;
         }
@@ -416,7 +417,7 @@ namespace leetcli {
         // Step 3: Map supported languages to file extensions
         std::map<std::string, std::string> lang_to_ext = {
             {"cpp", ".cpp"},
-            {"python", ".py"},
+            {"python3", ".py"},
             {"java", ".java"},
             {"javascript", ".js"},
             {"csharp", ".cs"}

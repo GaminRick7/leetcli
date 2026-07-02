@@ -6,9 +6,8 @@
 int main(int argc, char **argv) {
     std::vector<std::string> args(argv + 1, argv + argc);
     if (argc < 2) {
-        std::cout << "Usage:\n"
-                << "  leetcli --interactive\n";
-        return 1;
+        leetcli::run_tui();
+        return 0;
     }
 
     std::string command = argv[1];

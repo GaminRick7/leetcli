@@ -1,17 +1,22 @@
 #include "leetcode_api.h"
 #include "utils.h"
+#include "tui.h"
 #include <iostream>
 
 int main(int argc, char **argv) {
     std::vector<std::string> args(argv + 1, argv + argc);
     if (argc < 2) {
         std::cout << "Usage:\n"
-                << "  leetcli init\n"
-                << "  leetcli fetch <slug>\n";
+                << "  leetcli --interactive\n";
         return 1;
     }
 
     std::string command = argv[1];
+
+    if (command == "--interactive") {
+        leetcli::run_tui();
+        return 0;
+    }
 
     if (command == "init") {
         leetcli::init_problems_folder();
@@ -200,6 +205,7 @@ int main(int argc, char **argv) {
                   << "  leetcli hints <slug>                Gets the hints for the given problem in leetcode\n"
                   << "  leetcli topics <slug>               Gets the topics for the given problem in leetcode\n"
                   << "  leetcli config set-gemini-key <key> Set your Gemini API key\n"
+                  << "  leetcli --interactive               Open the interactive terminal UI\n"
                   << "  leetcli help                        Show this help message\n";
         return 0;
     }

@@ -5,12 +5,15 @@ set(CMAKE_CXX_STANDARD 17)
 
 find_package(cpr REQUIRED)
 find_package(nlohmann_json REQUIRED)
+find_package(ftxui REQUIRED)
 
 add_executable(leetcli
         src/main.cpp
         src/leetcode_api.cpp
         src/utils.cpp
+        src/tui.cpp
         include/utils.h
+        include/tui.h
 )
 
 # ▸▸▸ NEW: guarantee we get /SUBSYSTEM:CONSOLE on MSVC, no -mwindows on MinGW
@@ -19,6 +22,12 @@ set_target_properties(leetcli PROPERTIES
 )
 
 target_include_directories(leetcli PRIVATE include)
-target_link_libraries(leetcli PRIVATE cpr::cpr nlohmann_json::nlohmann_json)
+target_link_libraries(leetcli PRIVATE
+        cpr::cpr
+        nlohmann_json::nlohmann_json
+        ftxui::screen
+        ftxui::dom
+        ftxui::component
+)
 
 install(TARGETS leetcli RUNTIME DESTINATION bin)

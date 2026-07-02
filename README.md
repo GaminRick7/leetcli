@@ -58,6 +58,24 @@ The fastest way to get started. No need to install C++, CMake, or vcpkg.
 
 ---
 
+### 🍺 Homebrew (macOS/Linux)
+
+No need to set up vcpkg — Homebrew resolves the C++ dependencies for you.
+
+```sh
+brew install gaminrick7/leetcli/leetcli
+```
+
+Then get started:
+```sh
+mkdir ~/leetcode && cd ~/leetcode
+leetcli init
+leetcli login
+leetcli fetch two-sum
+```
+
+---
+
 ### 🐧 Linux/macOS
 
 1. **Install prerequisites**:

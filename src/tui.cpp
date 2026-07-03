@@ -1,6 +1,8 @@
 #include "tui.h"
 #include "leetcode_api.h"
 #include "utils.h"
+#include "image_cache.h"
+#include "image_protocol.h"
 
 #include <ftxui/component/component.hpp>
 #include <ftxui/component/component_base.hpp>
@@ -16,8 +18,10 @@
 #include <cctype>
 #include <cmath>
 #include <cstdlib>
+#include <deque>
 #include <filesystem>
 #include <fstream>
+#include <iostream>
 #include <sstream>
 #include <string>
 #include <thread>
@@ -694,6 +698,34 @@ void run_tui() {
     int browse_desc_offset = 0;
     Box browse_desc_box;
     bool browse_is_search = false;
+    // <img> placements found in browse_desc_cache/cached_desc, paired with
+    // each the same way *_desc_cache_slug/cached_key are. deque (not vector)
+    // so reflect()'s captured Box& references stay valid as more images are
+    // appended mid-parse (see ImagePlacement's doc comment in utils.h).
+    std::deque<ImagePlacement> browse_image_placements;
+    std::deque<ImagePlacement> cached_image_placements;
+    ImageCache image_cache;
+    ImageProtocol img_protocol = (get_image_rendering_pref() == "off")
+                                      ? ImageProtocol::None
+                                      : detect_image_protocol();
+    // Raw HTML each *_desc_cache was last built from, kept around so it can
+    // be cheaply re-parsed once a pending image finishes loading — the
+    // "[loading image]" placeholder baked into the first parse otherwise
+    // never gets replaced, since nothing else re-triggers html_to_ftxui
+    // outside of an actual selection change. images_ready_version bumps on
+    // every completed fetch (see on_image_ready below); each tab tracks the
+    // version it last rebuilt against and re-parses its stored HTML when
+    // they drift apart.
+    std::string cached_html;
+    std::string browse_desc_html;
+    std::atomic<int> images_ready_version{0};  // bumped from ImageCache's background fetch thread
+    int my_images_version = -1;
+    int browse_images_version = -1;
+    // What's actually been written to the real terminal via a graphics
+    // protocol right now, so draw_pending_images() only re-emits on change
+    // instead of redrawing every frame.
+    struct DrawnImage { uint32_t id; Box box; };
+    std::vector<DrawnImage> drawn_images;
 
     int tab_selected = 0;
     int desc_offset  = 0;
@@ -816,6 +848,88 @@ void run_tui() {
     // ── screen ─────────────────────────────────────────────────────────────
     auto screen = ScreenInteractive::Fullscreen();
 
+    // Wired into ImageCache::get_or_fetch as the "a decode finished"
+    // callback (runs on the cache's background fetch thread). Bumping
+    // images_ready_version tells render()'s version check (see below) to
+    // re-parse the stored HTML on the next frame, swapping any
+    // "[loading image]" placeholders for the now-cached real image;
+    // PostEvent is what actually wakes the main loop to run that frame.
+    auto on_image_ready = [&]() {
+        ++images_ready_version;
+        screen.PostEvent(Event::Custom);
+    };
+
+    // ftxui gives no hook to inject raw bytes into its own render/flush
+    // cycle (see the plan doc for why), so this writes Kitty/iTerm2 escape
+    // sequences to stdout directly, from the render() lambda itself — same
+    // thread, called just before render() returns its Element tree, i.e.
+    // strictly before ScreenInteractive::Draw() writes that tree's
+    // ToString() to std::cout for the same frame. Same-thread + sequential
+    // means no interleaving/corruption risk with ftxui's own output.
+    //
+    // Box positions come from reflect(), which (like everywhere else in this
+    // file, see move_sel's comment) is one frame behind: a freshly-appeared
+    // placeholder won't have a valid Box until the frame after it first
+    // renders. That's fine here — this just skips it for one frame.
+    //
+    // A placement's Box is only updated when its Element actually gets
+    // rendered — if it scrolls out of view, the description panel's
+    // desc_offset slicing (see the "Refresh cache"/full_desc code) excludes
+    // its Element from the tree entirely, so reflect() never runs on it that
+    // frame and the Box would otherwise just keep its last real value
+    // (stale, not cleared). render() resets every placement's Box to empty
+    // right after calling this, before rebuilding the (possibly sliced)
+    // tree, specifically so that "empty this frame" reliably means "not
+    // currently visible" (whether scrolled out or not laid out yet) rather
+    // than silently leaving a scrolled-past image floating on screen.
+    auto draw_pending_images = [&]() {
+        if (img_protocol == ImageProtocol::None) return;
+        const auto& active = (tab_selected == 0) ? cached_image_placements : browse_image_placements;
+
+        // Remove anything drawn that's no longer part of the active
+        // description, or is part of it but isn't currently visible (tab
+        // switch, problem switch, or scrolled out of view).
+        for (auto it = drawn_images.begin(); it != drawn_images.end();) {
+            auto found = std::find_if(active.begin(), active.end(),
+                                       [&](const ImagePlacement& p) { return p.id == it->id; });
+            bool still_visible = found != active.end() && !found->box.IsEmpty();
+            if (still_visible) {
+                ++it;
+            } else {
+                std::cout << build_delete_sequence(img_protocol, it->id);
+                it = drawn_images.erase(it);
+            }
+        }
+
+        for (const auto& p : active) {
+            if (p.box.IsEmpty() || !p.decoded) continue;  // not visible this frame, or still loading
+
+            auto drawn_it = std::find_if(drawn_images.begin(), drawn_images.end(),
+                                          [&](const DrawnImage& d) { return d.id == p.id; });
+            bool already_drawn_here = drawn_it != drawn_images.end() && drawn_it->box == p.box;
+            if (already_drawn_here) continue;
+
+            if (drawn_it != drawn_images.end()) std::cout << build_delete_sequence(img_protocol, p.id);
+
+            // Refit against the box's *actual* post-layout size (which can
+            // differ from the assumed width html_to_ftxui reserved it with)
+            // — always preserves aspect ratio exactly by construction,
+            // shrinking whichever dimension is the binding constraint,
+            // rather than deriving one dimension and clamping it (which
+            // silently distorts the image whenever the clamp kicks in).
+            int box_columns = std::max(1, p.box.x_max - p.box.x_min + 1);
+            int box_rows = std::max(1, p.box.y_max - p.box.y_min + 1);
+            int columns, rows;
+            fit_image_to_cells(p.decoded->width, p.decoded->height, box_columns, box_rows, columns, rows);
+            std::cout << "\x1b[" << (p.box.y_min + 1) << ";" << (p.box.x_min + 1) << "H";
+            std::cout << build_display_sequence(img_protocol, p.decoded->raw_bytes, p.decoded->rgba,
+                                                 p.decoded->width, p.decoded->height, columns, rows, p.id);
+
+            if (drawn_it != drawn_images.end()) *drawn_it = DrawnImage{p.id, p.box};
+            else drawn_images.push_back(DrawnImage{p.id, p.box});
+        }
+    };
+
     // Opens the currently selected My-Problems solution file in $EDITOR.
     // Shared by the manual 'e' and Return keyboard shortcuts.
     auto open_current_in_editor = [&]() {
@@ -867,6 +981,8 @@ void run_tui() {
                     browse_list_offset = 0;
                     browse_desc_cache.clear();
                     browse_desc_cache_slug = "\x01";
+                    browse_image_placements.clear();
+                    browse_desc_html.clear();
                     browse_desc_error.clear();
                     browse_desc_offset = 0;
                 }
@@ -907,9 +1023,15 @@ void run_tui() {
                     browse_desc_error = r.error;
                     browse_desc_cache.clear();
                     browse_desc_cache_slug = "\x01";
+                    browse_image_placements.clear();
+                    browse_desc_html.clear();
                 } else {
-                    browse_desc_cache = html_to_ftxui(r.content_html);
+                    browse_image_placements.clear();
+                    browse_desc_html = r.content_html;
+                    browse_desc_cache = html_to_ftxui(browse_desc_html, image_cache, "",
+                                                       on_image_ready, browse_image_placements);
                     browse_desc_cache_slug = slug;
+                    browse_images_version = images_ready_version.load();
                 }
                 screen.PostEvent(Event::Custom);
             });
@@ -1379,6 +1501,41 @@ void run_tui() {
             my_search_cache = my_search;
         }
 
+        // A background image fetch completed since the last time each tab's
+        // description was parsed — re-parse its stored HTML so the
+        // now-cached image replaces its "[loading image]" placeholder.
+        // Nothing else re-triggers html_to_ftxui just because a fetch
+        // finished (only an actual selection change does), so without this
+        // the placeholder would stick around until the user navigates away
+        // and back.
+        if (my_images_version != images_ready_version.load() && !cached_html.empty()) {
+            cached_image_placements.clear();
+            cached_desc = html_to_ftxui(cached_html, image_cache, cached_key + "/images",
+                                         on_image_ready, cached_image_placements);
+            my_images_version = images_ready_version.load();
+        }
+        if (browse_images_version != images_ready_version.load() && !browse_desc_html.empty()) {
+            browse_image_placements.clear();
+            browse_desc_cache = html_to_ftxui(browse_desc_html, image_cache, "",
+                                               on_image_ready, browse_image_placements);
+            browse_images_version = images_ready_version.load();
+        }
+
+        // Re-emit any Kitty/iTerm2 images whose on-screen position changed
+        // since last drawn (see draw_pending_images's own comment for why
+        // this has to happen here, on the main thread, rather than via a
+        // dedicated hook ftxui doesn't provide).
+        draw_pending_images();
+
+        // Clear every placement's Box now that draw_pending_images has read
+        // it — anything actually visible in the tree built below will get a
+        // fresh Box from reflect() during this frame's layout pass;
+        // anything scrolled out or otherwise excluded will correctly stay
+        // empty instead of keeping a stale position (see
+        // draw_pending_images's doc comment for why this matters).
+        for (auto& p : cached_image_placements) p.box = unset_image_box();
+        for (auto& p : browse_image_placements) p.box = unset_image_box();
+
         // ── Header ──
         auto tab_btn = [&](const std::string& label, bool active) -> Element {
             if (active)
@@ -1604,11 +1761,16 @@ void run_tui() {
             if (folder != cached_key) {
                 cached_key = folder;
                 std::string html_path = folder + "/description.html";
+                cached_image_placements.clear();
                 if (fs::exists(html_path)) {
-                    cached_desc = html_to_ftxui(read_file(html_path));
+                    cached_html = read_file(html_path);
+                    cached_desc = html_to_ftxui(cached_html, image_cache, folder + "/images",
+                                                 on_image_ready, cached_image_placements);
                 } else {
+                    cached_html.clear();
                     cached_desc = lines_to_paragraphs(read_file_lines(folder + "/README.md"));
                 }
+                my_images_version = images_ready_version.load();
                 std::string sol = find_solution_file(folder);
                 cached_solution_name = sol.empty()
                     ? "(no solution file)" : fs::path(sol).filename().string();
@@ -2307,6 +2469,11 @@ void run_tui() {
     });
 
     screen.Loop(root);
+
+    // Don't leave a floating Kitty/iTerm2 image on screen after leetcli
+    // exits — the terminal doesn't know to clear it on its own.
+    for (const auto& d : drawn_images) std::cout << build_delete_sequence(img_protocol, d.id);
+    std::cout.flush();
 }
 
 }  // namespace leetcli

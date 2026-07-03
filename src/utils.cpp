@@ -1,4 +1,5 @@
 #include "utils.h"
+#include "image_protocol.h"
 #include <regex>
 #include <fstream>
 #include <filesystem>
@@ -126,9 +127,40 @@ namespace {
         if (end != std::string::npos) body = body.substr(0, end);
         return html_lower(html_trim(body));
     }
+
+    // Extracts an attribute's value from a raw tag body, e.g.
+    // attr_value("img src=\"https://x/y.png\" alt=\"z\"", "src") -> the URL.
+    // Requires the attribute name to start at a word boundary so e.g.
+    // "data-src=" doesn't get mistaken for "src=".
+    std::string attr_value(const std::string& raw_tag, const std::string& attr) {
+        std::string lower = html_lower(raw_tag);
+        std::string needle = attr + "=";
+        size_t pos = 0;
+        while (true) {
+            pos = lower.find(needle, pos);
+            if (pos == std::string::npos) return "";
+            bool boundary = (pos == 0) || std::isspace(static_cast<unsigned char>(lower[pos - 1]));
+            if (boundary) break;
+            pos += needle.size();
+        }
+        pos += needle.size();
+        if (pos >= raw_tag.size()) return "";
+        char quote = raw_tag[pos];
+        if (quote == '"' || quote == '\'') {
+            size_t end = raw_tag.find(quote, pos + 1);
+            if (end == std::string::npos) return "";
+            return raw_tag.substr(pos + 1, end - pos - 1);
+        }
+        size_t end = raw_tag.find_first_of(" \t\r\n", pos);
+        if (end == std::string::npos) end = raw_tag.size();
+        return raw_tag.substr(pos, end - pos);
+    }
 }  // namespace
 
-Elements html_to_ftxui(const std::string& html) {
+Elements html_to_ftxui(const std::string& html, ImageCache& cache,
+                        const std::string& disk_cache_dir,
+                        const std::function<void()>& on_image_ready,
+                        std::deque<ImagePlacement>& out_placements) {
     Elements out;
 
     int bold_depth = 0, italic_depth = 0, code_depth = 0, sup_depth = 0, heading_depth = 0;
@@ -157,7 +189,7 @@ Elements html_to_ftxui(const std::string& html) {
     auto flush_paragraph = [&](bool spacer) {
         flush_word();
         if (!current_line_words.empty()) {
-            out.push_back(flexbox(current_line_words, FlexboxConfig().SetGap(1, 0)));
+            out.push_back(flexbox(current_line_words, FlexboxConfig().SetGap(0, 0)));
             current_line_words.clear();
             last_was_blank = false;
         }
@@ -199,7 +231,18 @@ Elements html_to_ftxui(const std::string& html) {
         size_t j = 0;
         while (j < s.size()) {
             if (std::isspace(static_cast<unsigned char>(s[j]))) {
+                bool had_word = !current_word_parts.empty();
+                bool code_space = code_depth > 0;
                 flush_word();
+                // Insert the inter-word gap as an explicit element (instead of
+                // relying on the flexbox gap) so a bgcolor'd run (e.g. a
+                // multi-word <code> span) stays visually contiguous instead of
+                // showing an uncolored seam between words.
+                if (had_word) {
+                    Element sp = text(" ");
+                    if (code_space) sp = sp | color(kCodeFg) | bgcolor(kCodeBg);
+                    current_line_words.push_back(sp);
+                }
                 ++j;
                 continue;
             }
@@ -248,7 +291,7 @@ Elements html_to_ftxui(const std::string& html) {
             } else if (name == "br") {
                 flush_word();
                 if (!current_line_words.empty()) {
-                    out.push_back(flexbox(current_line_words, FlexboxConfig().SetGap(1, 0)));
+                    out.push_back(flexbox(current_line_words, FlexboxConfig().SetGap(0, 0)));
                     current_line_words.clear();
                 }
             } else if (name == "strong" || name == "b") {
@@ -290,11 +333,36 @@ Elements html_to_ftxui(const std::string& html) {
                         }
                     }
                     current_line_words.push_back(text(indent + marker) | color(kDescAccent) | bold);
+                    current_line_words.push_back(text(" "));
                 } else {
                     flush_paragraph(false);
                 }
             } else if (name == "img") {
-                // skip entirely, no text content to preserve
+                if (!closing) {
+                    std::string src = attr_value(raw_tag, "src");
+                    if (!src.empty()) {
+                        flush_paragraph(false);
+                        if (!last_was_blank) out.push_back(text(""));
+                        const DecodedImage* decoded = cache.get_or_fetch(src, disk_cache_dir, on_image_ready);
+                        if (decoded) {
+                            out_placements.push_back(
+                                ImagePlacement{src, unset_image_box(), next_kitty_image_id(), decoded});
+                            int cols, rows;
+                            fit_image_to_cells(decoded->width, decoded->height, kImagePlaceholderColumns,
+                                                kImagePlaceholderMaxRows, cols, rows);
+                            Elements blank_lines(rows, text(""));
+                            out.push_back(vbox(blank_lines)
+                                              | size(WIDTH, EQUAL, cols)
+                                              | size(HEIGHT, EQUAL, rows)
+                                              | reflect(out_placements.back().box));
+                        } else {
+                            out.push_back(text("[loading image]") | color(kDescMuted) | italic);
+                        }
+                        out.push_back(text(""));
+                        last_was_blank = true;
+                    }
+                }
+                // </img> never occurs (void element) — nothing to do on close.
             }
             // Any other/unknown tag (div, span, a, table, ...): ignore the
             // tag boundary itself but keep flowing its inner text.
@@ -458,6 +526,14 @@ Elements html_to_ftxui(const std::string& html) {
         return config.value("lang", "cpp"); // fallback to cpp
     }
 
+    std::string get_image_rendering_pref() {
+        std::filesystem::path config_path = std::filesystem::path(get_home()) / ".leetcli/config.json";
+        std::ifstream in(config_path);
+        if (!in) return "auto";
+        nlohmann::json config;
+        in >> config;
+        return config.value("image_rendering", "auto"); // "auto" or "off"
+    }
 
     std::string get_problems_dir() {
         std::filesystem::path config_path = get_home() / ".leetcli/config.json";

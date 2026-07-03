@@ -12,8 +12,12 @@ add_executable(leetcli
         src/leetcode_api.cpp
         src/utils.cpp
         src/tui.cpp
+        src/image_protocol.cpp
+        src/image_cache.cpp
         include/utils.h
         include/tui.h
+        include/image_protocol.h
+        include/image_cache.h
 )
 
 # ▸▸▸ NEW: guarantee we get /SUBSYSTEM:CONSOLE on MSVC, no -mwindows on MinGW
@@ -21,7 +25,7 @@ set_target_properties(leetcli PROPERTIES
         WIN32_EXECUTABLE FALSE        # never build as a GUI app
 )
 
-target_include_directories(leetcli PRIVATE include)
+target_include_directories(leetcli PRIVATE include third_party)
 target_link_libraries(leetcli PRIVATE
         cpr::cpr
         nlohmann_json::nlohmann_json

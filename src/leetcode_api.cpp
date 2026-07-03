@@ -10,6 +10,19 @@
 
 namespace leetcli {
 
+namespace {
+    // json::value(key, default) only substitutes the default when the key is
+    // *absent* — if the key is present but null (which LeetCode's API does
+    // for e.g. a Premium-only question's `content` when unauthenticated), it
+    // still tries to convert null to the target type and throws
+    // json::type_error 302. This treats present-but-null the same as absent.
+    std::string json_str(const nlohmann::json& obj, const std::string& key, const std::string& def = "") {
+        auto it = obj.find(key);
+        if (it == obj.end() || it->is_null()) return def;
+        return it->get<std::string>();
+    }
+}
+
     // LeetCode's bot protection rejects requests to the run/submit endpoints
     // that don't look like a real browser (cpr's default User-Agent gets a
     // 403), so run_against_testcases/submit_and_poll spoof one.
@@ -301,8 +314,11 @@ namespace leetcli {
             }
 
             auto question = json["data"]["question"];
-            result.title = question.value("title", "");
-            result.content_html = question.value("content", "");
+            result.title = json_str(question, "title");
+            result.content_html = json_str(question, "content");
+            if (result.content_html.empty()) {
+                result.error = "This problem's description isn't available — it may require a LeetCode Premium subscription.";
+            }
         } catch (const std::exception &e) {
             result.error = std::string("Unexpected error: ") + e.what();
         } catch (...) {
@@ -348,36 +364,44 @@ namespace leetcli {
             return "Failed to fetch problem.";
         }
 
-        // Parse response JSON
-        auto json = nlohmann::json::parse(r.text);
+        std::string title, id, difficulty, content_html, markdown, dir, safe_title;
+        std::vector<std::string> topics, hints;
+        try {
+            // Parse response JSON
+            auto json = nlohmann::json::parse(r.text);
 
-        // Check for missing or null question field
-        if (!json.contains("data") || json["data"].is_null() || !json["data"].contains("question") || json["data"][
-                "question"].is_null()) {
-            return "Problem not found. Check the title slug: \"" + slug + "\"";
-        }
+            // Check for missing or null question field
+            if (!json.contains("data") || json["data"].is_null() || !json["data"].contains("question") ||
+                json["data"]["question"].is_null()) {
+                return "Problem not found. Check the title slug: \"" + slug + "\"";
+            }
 
-        auto question = json["data"]["question"];
+            auto question = json["data"]["question"];
 
-        std::string title = question["title"];
-        std::string id = question["questionId"];
-        std::string difficulty = question.value("difficulty", "");
-        std::string content_html = question.value("content", "");
-        std::string markdown = html_to_text(content_html);
+            title = json_str(question, "title");
+            id = json_str(question, "questionId");
+            difficulty = json_str(question, "difficulty");
+            content_html = json_str(question, "content");
+            if (content_html.empty()) {
+                return "This problem's description isn't available — it may require a LeetCode Premium subscription.";
+            }
+            markdown = html_to_text(content_html);
 
-        // Make safe folder path: problems/{id}. {title}/
-        std::string safe_title = std::regex_replace(title, std::regex("[\\\\/:*?\"<>|]"), "");
-        std::string dir = get_problems_dir() + "/" + id + ". " + safe_title;
-        std::filesystem::create_directories(dir);
+            // Make safe folder path: problems/{id}. {title}/
+            safe_title = std::regex_replace(title, std::regex("[\\\\/:*?\"<>|]"), "");
+            dir = get_problems_dir() + "/" + id + ". " + safe_title;
+            std::filesystem::create_directories(dir);
 
-        std::vector<std::string> topics;
-        for (const auto &topic_json : question["topicTags"]) {
-            topics.push_back(topic_json.value("name", ""));
-        }
-        std::vector<std::string> hints;
-        for (const auto &hint_json : question["hints"]) {
-            std::string hint = hint_json.get<std::string>();
-            hints.push_back(std::regex_replace(hint, std::regex("<.*?>"), ""));
+            for (const auto &topic_json : question["topicTags"]) {
+                topics.push_back(json_str(topic_json, "name"));
+            }
+            for (const auto &hint_json : question["hints"]) {
+                if (!hint_json.is_string()) continue;
+                std::string hint = hint_json.get<std::string>();
+                hints.push_back(std::regex_replace(hint, std::regex("<.*?>"), ""));
+            }
+        } catch (const std::exception &e) {
+            return std::string("Unexpected error: ") + e.what();
         }
 
         // Write files

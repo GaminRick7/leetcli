@@ -61,9 +61,13 @@ namespace {
                 // many cells (rather than specifying only one and letting
                 // the terminal preserve aspect ratio) — must match the fixed
                 // ftxui placeholder box size, see the header doc comment.
+                // q=2 suppresses the terminal's OK/error acknowledgement
+                // reply. Without it, Kitty/Ghostty answer each image with an
+                // APC "\x1b_Gi=<id>;OK\x1b\\" response on stdin, which leaks
+                // into the TUI's input bar as stray "Gi=2;OK" text.
                 out += "f=32,a=T,t=d,s=" + std::to_string(width) + ",v=" + std::to_string(height) +
                        ",c=" + std::to_string(columns) + ",r=" + std::to_string(rows) +
-                       ",i=" + std::to_string(id) + ",m=" + (last ? "0" : "1");
+                       ",i=" + std::to_string(id) + ",q=2,m=" + (last ? "0" : "1");
             } else {
                 out += "m=";
                 out += (last ? "0" : "1");
@@ -99,9 +103,15 @@ ImageProtocol detect_image_protocol() {
         std::string prog = tp;
         if (prog == "WezTerm") return ImageProtocol::Kitty;  // WezTerm implements the Kitty graphics protocol
         if (prog == "WarpTerminal") return ImageProtocol::Kitty;  // Warp also implements it
+        if (prog == "ghostty") return ImageProtocol::Kitty;  // Ghostty implements the Kitty graphics protocol
         if (prog == "iTerm.app") return ImageProtocol::ITerm2;
     }
-    if (auto* term = std::getenv("TERM"); term && std::strcmp(term, "xterm-kitty") == 0) {
+    // Ghostty ships terminfo as "xterm-ghostty" and doesn't set KITTY_WINDOW_ID;
+    // GHOSTTY_RESOURCES_DIR is its reliable marker when TERM_PROGRAM is stripped
+    // (e.g. over ssh/tmux/sudo).
+    if (auto* g = std::getenv("GHOSTTY_RESOURCES_DIR"); g && *g) return ImageProtocol::Kitty;
+    if (auto* term = std::getenv("TERM"); term &&
+        (std::strcmp(term, "xterm-kitty") == 0 || std::strcmp(term, "xterm-ghostty") == 0)) {
         return ImageProtocol::Kitty;
     }
     return ImageProtocol::None;
@@ -121,7 +131,7 @@ std::string build_display_sequence(ImageProtocol proto,
 
 std::string build_delete_sequence(ImageProtocol proto, uint32_t id) {
     if (proto != ImageProtocol::Kitty) return "";
-    return "\x1b_Ga=d,d=i,i=" + std::to_string(id) + "\x1b\\";
+    return "\x1b_Ga=d,d=i,i=" + std::to_string(id) + ",q=2\x1b\\";
 }
 
 uint32_t next_kitty_image_id() {

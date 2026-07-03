@@ -1,4 +1,5 @@
 #pragma once
+#include <functional>
 #include <string>
 #include <vector>
 
@@ -18,6 +19,10 @@ namespace leetcli {
 
     // Fetches one page of 100 problems. Pass keyword="" for unfiltered paged browsing.
     ProblemPage fetch_problem_page(int skip, const std::string& keyword = "");
+
+    // Fetches today's daily challenge as a ProblemSummary. An empty `slug` in
+    // the result means it couldn't be fetched.
+    ProblemSummary fetch_daily_problem();
 
     struct ProblemDescription {
         std::string title;
@@ -120,6 +125,30 @@ namespace leetcli {
     SubmitResult submit_and_poll(const std::string& slug, const std::string& folder,
                                  const std::string& lang, const std::string& code);
 
+    // Progress snapshot for `sync_problems`. Passed to the on_progress
+    // callback after each processed problem (and once at the end with
+    // finished=true, or immediately with a non-empty `error` on failure).
+    struct SyncProgress {
+        int done = 0;               // problems processed so far
+        int total = 0;              // total to process (0 until enumeration finishes)
+        std::string current;        // slug currently being processed
+        std::string last_result;    // short outcome of the just-finished item, e.g. "solved", "attempted (no code)"
+        bool finished = false;      // true on the final callback
+        std::string error;          // fatal error (auth/enumeration); empty on the happy path
+    };
+
+    // Downloads every solved + attempted problem on the logged-in account
+    // locally: the problem folder (README/description/testcases/…) plus your
+    // latest submission's code (most recent Accepted for solved problems, most
+    // recent of any verdict for attempted ones), saved in the language you
+    // solved it in. Writes a `.status` sidecar (ac/notac) per folder. Existing
+    // folders are not re-downloaded, but a missing solution file is still
+    // filled in. `limit` <= 0 means all; otherwise stop after `limit` problems.
+    // `on_progress` (optional) is invoked from the calling thread after each
+    // item — the CLI prints a line, the TUI posts a progress-bar redraw.
+    // Requires a stored LeetCode session (see `leetcli login`).
+    void sync_problems(int limit, const std::function<void(const SyncProgress&)>& on_progress = {});
+
     std::string get_daily_question_slug();
     std::string fetch_problem(const std::string& slug, const std::string& lang_override);
     std::string read_question_id_from_readme(const std::string& path);
@@ -134,4 +163,7 @@ namespace leetcli {
     void give_hint(const std::string& slug, const std::string &lang_override);
     void fetch_problem_topics(const std::string &slug);
     void fetch_problem_hints(const std::string &slug);
+    // Deletes the local solution file(s) for a problem, leaving the rest of
+    // its folder (README/description/testcases/…) intact.
+    void reset_solution(const std::string &slug);
 }

@@ -16,6 +16,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cctype>
+#include <functional>
 #include <cmath>
 #include <cstdlib>
 #include <deque>
@@ -170,7 +171,17 @@ bool has_leetcode_session() {
 // solved reflects only submissions made through this app's Submit tab (a
 // local <folder>/.solved marker written on Accepted) — not your real
 // LeetCode account history, which would need a network query per problem.
-struct MyProblem { std::string label, folder, slug, difficulty; bool solved; };
+struct MyProblem { std::string label, folder, slug, difficulty; bool solved; bool attempted = false; };
+
+// One entry in the contextual Actions menu (opened with Space). `key` is the
+// accelerator that also triggers the action directly with the menu closed;
+// `danger` renders it in the warning color (destructive / consequential).
+struct MenuAction {
+    char key;
+    std::string label;
+    bool danger = false;
+    std::function<void()> run;
+};
 
 // Every language LeetCode's codeSnippets can return (langSlug), offered by
 // the "Start solution" dropdown. `ext` is the sole source of truth for the
@@ -230,6 +241,11 @@ const Color kMedium     = Color::RGB(240, 180, 40);
 const Color kHard       = Color::RGB(230, 70, 70);
 const Color kFetched    = Color::RGB(80, 220, 140);
 const Color kMuted      = Color::RGB(190, 195, 210);
+
+// Nerd Font "calendar" glyph (nf-fa-calendar), used to mark the pinned daily
+// challenge — a monochrome icon rather than a colored emoji. Requires a Nerd
+// Font-patched terminal font; falls back to a blank box if unavailable.
+const std::string kDailyIcon = "";
 const Color kText       = Color::RGB(210, 215, 230);
 const Color kHoverBg    = Color::RGB(45, 50, 66);
 
@@ -686,6 +702,7 @@ void run_tui() {
     std::atomic<size_t> spinner_idx{0};
     std::string browse_error;
     std::string browse_keyword;
+    std::string daily_slug;  // slug of the daily challenge pinned atop the browse list
 
     // In-memory-only preview of the selected Browse-All problem's
     // description — never written to disk. Cleared/replaced whenever
@@ -758,6 +775,16 @@ void run_tui() {
     int sol_tab = 0;  // 0 = Code, 1 = Run, 2 = Submit
     Box sol_tab_code_box, sol_tab_run_box, sol_tab_submit_box;
 
+    // Contextual Actions menu (Space). The item list is rebuilt each frame
+    // from the current state by build_actions (assigned once, further down,
+    // after the action lambdas it calls exist). Declared here as a
+    // std::function so the render lambda — defined before that assignment —
+    // can still capture and call it; it's populated before the event loop runs.
+    bool actions_open = false;
+    int actions_highlight = 0;
+    std::vector<Box> actions_row_boxes;
+    std::function<std::vector<MenuAction>()> build_actions;
+
     std::atomic<bool> run_loading{false};
     bool run_has_result = false;
     RunResult cached_run_result;
@@ -765,6 +792,14 @@ void run_tui() {
     std::atomic<bool> submit_loading{false};
     bool submit_has_result = false;
     SubmitResult cached_submit_result;
+
+    // Sync (download all solved + attempted problems). Runs on a background
+    // thread; sync_problems' progress callback posts updates back to these
+    // plain fields via screen.Post (so they're only ever touched on the UI
+    // thread). sync_running gates re-entry and drives the progress banner.
+    std::atomic<bool> sync_running{false};
+    int sync_done = 0, sync_total = 0;
+    std::string sync_current, sync_last, sync_error;
 
     // Topics / Hints (dropdown accordions, lazily loaded and cached to disk).
     // These are rendered as plain Elements (not ftxui Components) with
@@ -804,7 +839,13 @@ void run_tui() {
                 if (!slug_lines.empty()) mp.slug = slug_lines[0];
                 auto difficulty_lines = read_file_lines(mp.folder + "/.difficulty");
                 if (!difficulty_lines.empty()) mp.difficulty = difficulty_lines[0];
-                mp.solved = fs::exists(mp.folder + "/.solved");
+                // `.solved` is written on a successful submit; `.status`
+                // (ac/notac) comes from `leetcli sync`. Either "ac" source
+                // counts as solved; "notac" marks an attempt.
+                auto status_lines = read_file_lines(mp.folder + "/.status");
+                std::string status = status_lines.empty() ? "" : status_lines[0];
+                mp.solved = fs::exists(mp.folder + "/.solved") || status == "ac";
+                mp.attempted = (status == "notac") && !mp.solved;
                 my_all.push_back(std::move(mp));
             }
         // Most recently worked on first (see last_worked_on), ties broken by
@@ -966,8 +1007,12 @@ void run_tui() {
                 return;
             }
             ProblemPage result = fetch_problem_page(page * 100, keyword);
+            // The daily challenge is pinned to the top of the unfiltered first
+            // page only, so fetch it just for that case.
+            ProblemSummary daily;
+            if (page == 0 && keyword.empty()) daily = fetch_daily_problem();
             browse_loading = false;  // stops the spinner thread
-            screen.Post([&, r = std::move(result), page, keyword]() mutable {
+            screen.Post([&, r = std::move(result), d = std::move(daily), page, keyword]() mutable {
                 if (!r.error.empty()) {
                     browse_error = r.error;
                 } else {
@@ -979,6 +1024,18 @@ void run_tui() {
                     browse_hovered   = 0;
                     browse_selected  = -1;
                     browse_list_offset = 0;
+
+                    // Pin today's daily challenge to the top of the first
+                    // unfiltered page, removing any natural duplicate so it
+                    // appears exactly once (marked with the calendar glyph).
+                    if (page == 0 && keyword.empty() && !d.slug.empty()) {
+                        daily_slug = d.slug;
+                        browse_problems.erase(
+                            std::remove_if(browse_problems.begin(), browse_problems.end(),
+                                [&](const ProblemSummary& p) { return p.slug == d.slug; }),
+                            browse_problems.end());
+                        browse_problems.insert(browse_problems.begin(), d);
+                    }
                     browse_desc_cache.clear();
                     browse_desc_cache_slug = "\x01";
                     browse_image_placements.clear();
@@ -1121,6 +1178,27 @@ void run_tui() {
         }).detach();
     };
 
+    // Deletes the current problem's solution file(s), returning it to the
+    // "no solution yet" state (the Start-solution flow reappears). Confirmed
+    // via CONFIRM_RESET before this runs. Leaves README/description/.status
+    // etc. intact — only the solution code is removed.
+    auto reset_current_solution = [&]() {
+        if (my_filtered.empty() || !cached_has_solution) return;
+        const std::string folder = my_all[my_filtered[my_selected]].folder;
+        std::error_code ec;
+        for (const auto& entry : fs::directory_iterator(folder, ec)) {
+            if (entry.path().filename().string().rfind("solution.", 0) == 0)
+                fs::remove(entry.path(), ec);
+        }
+        cached_has_solution = false;
+        cached_solution.clear();
+        cached_solution_name = "(no solution file)";
+        sol_tab = 0;
+        run_has_result = false;
+        submit_has_result = false;
+        cached_key = "\x01";  // force the panel to reload from disk on next render
+    };
+
     auto open_lang_dropdown = [&]() {
         start_lang_highlight = start_lang_idx;
         start_lang_open = true;
@@ -1211,6 +1289,41 @@ void run_tui() {
                 }
                 cached_submit_result = std::move(r);
                 submit_has_result = true;
+                screen.PostEvent(Event::Custom);
+            });
+        }).detach();
+    };
+
+    // Kicks off a full account sync on a background thread: downloads every
+    // solved + attempted problem (folder + your submitted code) locally.
+    // Progress posts back to the sync_* fields on the UI thread; on completion
+    // the My Problems list is reloaded so the new folders appear.
+    auto start_sync_flow = [&]() {
+        if (sync_running.load()) return;
+        sync_error.clear();
+        if (!has_leetcode_session()) {
+            sync_error = "Run `leetcli login` first to sync your problems.";
+            screen.PostEvent(Event::Custom);
+            return;
+        }
+        sync_running = true;
+        sync_done = 0; sync_total = 0; sync_current.clear(); sync_last.clear();
+
+        std::thread([&]() {
+            sync_problems(0, [&](const SyncProgress& p) {
+                screen.Post([&, snapshot = p]() {
+                    ++spinner_idx;  // advance the banner spinner on each update
+                    sync_done    = snapshot.done;
+                    sync_total   = snapshot.total;
+                    sync_current = snapshot.current;
+                    sync_last    = snapshot.last_result;
+                    if (!snapshot.error.empty()) sync_error = snapshot.error;
+                    if (snapshot.finished) {
+                        sync_running = false;
+                        load_my_problems();
+                        recompute_my();
+                    }
+                });
                 screen.PostEvent(Event::Custom);
             });
         }).detach();
@@ -1439,7 +1552,7 @@ void run_tui() {
     };
 
     // ── input widgets ──────────────────────────────────────────────────────
-    enum Mode { NAV, SEARCH, FETCH };
+    enum Mode { NAV, SEARCH, FETCH, CONFIRM_RESET, HELP };
     Mode mode = NAV;
     std::string search_text;
     std::string fetch_slug;
@@ -1508,18 +1621,30 @@ void run_tui() {
         // finished (only an actual selection change does), so without this
         // the placeholder would stick around until the user navigates away
         // and back.
+        bool reparsed_for_images = false;
         if (my_images_version != images_ready_version.load() && !cached_html.empty()) {
             cached_image_placements.clear();
             cached_desc = html_to_ftxui(cached_html, image_cache, cached_key + "/images",
                                          on_image_ready, cached_image_placements);
             my_images_version = images_ready_version.load();
+            reparsed_for_images = true;
         }
         if (browse_images_version != images_ready_version.load() && !browse_desc_html.empty()) {
             browse_image_placements.clear();
             browse_desc_cache = html_to_ftxui(browse_desc_html, image_cache, "",
                                                on_image_ready, browse_image_placements);
             browse_images_version = images_ready_version.load();
+            reparsed_for_images = true;
         }
+
+        // A just-completed fetch means one or more placements now have a
+        // decoded image but no valid Box yet — reflect() only fills the Box
+        // during *this* frame's layout pass, which draw_pending_images()
+        // (running below, before layout) can't see. Force one more frame so
+        // the now-positioned image actually gets emitted; without it the
+        // image stays invisible until the next unrelated input event redraws
+        // the screen ("images don't load until I press something").
+        if (reparsed_for_images) screen.PostEvent(Event::Custom);
 
         // Re-emit any Kitty/iTerm2 images whose on-screen position changed
         // since last drawn (see draw_pending_images's own comment for why
@@ -1595,7 +1720,9 @@ void run_tui() {
                 Color row_color = chosen ? Color::Black : (hovered ? Color::White : kMuted);
                 Element row = hbox({
                     hovered ? text(" >") | bold | color(row_color) : text("   "),
-                    mp.solved ? text("✓") | bold | color(kFetched) : text(" "),
+                    mp.solved    ? text("✓") | bold | color(kFetched)
+                    : mp.attempted ? text("•") | bold | color(kMuted)
+                                   : text(" "),
                     text(" " + mp.label) | (hovered || chosen ? bold : dim) | color(row_color) | flex,
                     text(" "),
                     text(mp.difficulty.empty() ? " " : mp.difficulty.substr(0, 1))
@@ -1623,13 +1750,38 @@ void run_tui() {
             std::string count_str = " " + std::to_string(my_all.size()) + " problem"
                 + (my_all.size() != 1 ? "s" : "") + " ";
 
+            Elements panel_rows;
+            panel_rows.push_back(search_bar);
+            panel_rows.push_back(separatorStyled(LIGHT) | color(kBorder));
+
+            // Sync progress / error banner (only while a sync is running or
+            // right after one failed to start).
+            if (sync_running.load() || !sync_error.empty()) {
+                Element banner;
+                if (!sync_error.empty() && !sync_running.load()) {
+                    banner = text("  ! " + sync_error) | color(kHard) | italic;
+                } else {
+                    std::string frac = sync_total > 0
+                        ? std::to_string(sync_done) + "/" + std::to_string(sync_total)
+                        : "listing…";
+                    std::string detail = sync_current.empty() ? sync_last : sync_current;
+                    banner = vbox({
+                        hbox({
+                            spinner(15, spinner_idx.load()) | color(kAccent),
+                            text("  Syncing " + frac) | bold | color(kAccent),
+                        }),
+                        text("  " + detail) | color(kMuted) | dim,
+                    });
+                }
+                panel_rows.push_back(banner);
+                panel_rows.push_back(separatorStyled(LIGHT) | color(kBorder));
+            }
+
+            panel_rows.push_back(vbox(std::move(visible_items)) | reflect(my_items_box) | flex);
+
             left = window(
                 hbox({text(count_str) | bold | color(kAccent)}),
-                vbox({
-                    search_bar,
-                    separatorStyled(LIGHT) | color(kBorder),
-                    vbox(std::move(visible_items)) | reflect(my_items_box) | flex,
-                })
+                vbox(std::move(panel_rows))
             ) | color(kBorder) | reflect(left_list_box);
 
         } else {
@@ -1672,6 +1824,7 @@ void run_tui() {
                     bool chosen = (i == browse_selected);
                     const auto& p = browse_problems[i];
                     bool fetched = is_fetched(p);
+                    bool is_daily = !daily_slug.empty() && p.slug == daily_slug;
 
                     // Selection (whichever row is actually previewed on the
                     // right) gets a white background + black text — takes
@@ -1683,6 +1836,8 @@ void run_tui() {
                     Element row = hbox({
                         hovered ? text(" >") | bold | color(row_color) : text("   "),
                         fetched ? text("+") | bold | color(kFetched) : text(" "),
+                        is_daily ? text(" " + kDailyIcon) | bold | color(chosen ? Color::Black : kAccent)
+                                 : text("  "),
                         text(" " + p.id + ". ") | color(row_color) | (hovered || chosen ? bold : dim),
                         text(p.title) | (hovered || chosen ? bold : dim) | color(row_color) | flex,
                         text(" "),
@@ -1973,11 +2128,11 @@ void run_tui() {
                     return e | reflect(box);
                 };
                 Element tabs = hbox({
-                    sol_tab_btn("Code", sol_tab == 0, sol_tab_code_box),
+                    sol_tab_btn("Code (c)", sol_tab == 0, sol_tab_code_box),
                     text(" "),
-                    sol_tab_btn("Run", sol_tab == 1, sol_tab_run_box),
+                    sol_tab_btn("Run (r)", sol_tab == 1, sol_tab_run_box),
                     text(" "),
-                    sol_tab_btn("Submit", sol_tab == 2, sol_tab_submit_box),
+                    sol_tab_btn("Submit (s)", sol_tab == 2, sol_tab_submit_box),
                 });
 
                 Element sol_content;
@@ -2128,18 +2283,26 @@ void run_tui() {
                 kbd("Enter"), text(" go   ") | color(kMuted),
                 kbd("Esc"), text(" cancel  ") | color(kMuted),
             });
+        } else if (mode == CONFIRM_RESET) {
+            std::string name = my_filtered.empty() ? "" : my_all[my_filtered[my_selected]].label;
+            footer = hbox({
+                text("  Delete solution for ") | color(kMuted),
+                text(name) | bold | color(kHard),
+                text("? ") | color(kMuted),
+                kbd("y"), text(" yes  ") | color(kMuted),
+                kbd("n"), text(" no  ") | color(kMuted),
+            });
         } else if (tab_selected == 0) {
+            // Core keys only — everything else lives in the Actions menu (Space)
+            // and the full keymap (?), so this line stays short and stable.
             footer = hbox({
                 text("  "),
-                kbd("↑↓"), text(" nav  ") | color(kMuted),
+                kbd("↑↓"), text(" move  ") | color(kMuted),
+                kbd("⏎"), text(" open  ") | color(kMuted),
+                kbd("Space"), text(" actions  ") | color(kAccent),
                 kbd("/"), text(" filter  ") | color(kMuted),
-                kbd("e"), text(" edit  ") | color(kMuted),
-                kbd("f"), text(" fetch  ") | color(kMuted),
-                kbd("v"), text(" run/submit tab  ") | color(kMuted),
-                kbd("t"), text(" topics  ") | color(kMuted),
-                kbd("1-9"), text(" hints  ") | color(kMuted),
-                kbd("PgUp/Dn"), text(" scroll  ") | color(kMuted),
                 kbd("Tab"), text(" browse  ") | color(kMuted),
+                kbd("?"), text(" help  ") | color(kMuted),
                 kbd("q"), text(" quit  ") | color(kMuted),
             });
         } else {
@@ -2155,9 +2318,7 @@ void run_tui() {
                 kbd("q"), text(" quit  ") | color(kMuted),
             });
         }
-        footer = footer;
-
-        return vbox({
+        Element page = vbox({
             header,
             separatorStyled(LIGHT) | color(kBorder),
             hbox({
@@ -2167,6 +2328,80 @@ void run_tui() {
             separatorStyled(LIGHT) | color(kBorder),
             footer,
         }) | borderStyled(ROUNDED, kBorder);
+
+        // ── Actions menu overlay (Space) ──
+        if (actions_open) {
+            auto acts = build_actions();
+            if (!acts.empty())
+                actions_highlight = std::clamp(actions_highlight, 0, (int)acts.size() - 1);
+            actions_row_boxes.assign(acts.size(), Box{});
+            Elements rows;
+            for (int i = 0; i < (int)acts.size(); ++i) {
+                const bool sel = (i == actions_highlight);
+                Color base = acts[i].danger ? kHard : kText;
+                Element label = text(acts[i].label);
+                label = sel ? (label | bold | color(Color::Black)) : (label | color(base));
+                Element row = hbox({
+                    text(sel ? " ▸ " : "   "),
+                    text(std::string(1, acts[i].key)) | bold
+                        | color(sel ? Color::Black : kAccent),
+                    text("  "),
+                    label | flex,
+                    text("  "),
+                });
+                if (sel) row = row | bgcolor(Color::White);
+                rows.push_back(row | reflect(actions_row_boxes[i]));
+            }
+            Element menu = window(
+                text(" Actions ") | bold | color(kAccent),
+                vbox(std::move(rows))
+            ) | size(WIDTH, EQUAL, 34) | color(kBorder) | clear_under;
+            page = dbox({page, menu | center});
+        }
+
+        // ── Full keymap overlay (?) ──
+        if (mode == HELP) {
+            auto row = [&](const std::string& keys, const std::string& desc) {
+                return hbox({
+                    text("  "), text(keys) | bold | color(kAccent) | size(WIDTH, EQUAL, 12),
+                    text(desc) | color(kText),
+                });
+            };
+            auto section = [&](const std::string& title) {
+                return text("  " + title) | bold | color(kMuted);
+            };
+            Element keys = vbox({
+                section("Navigate"),
+                row("↑↓ / j k", "move selection"),
+                row("Tab", "switch My Problems / Browse All"),
+                row("PgUp/PgDn", "scroll the description"),
+                row("/", "filter (My Problems) or search (Browse)"),
+                row("q", "quit"),
+                text(""),
+                section("My Problems"),
+                row("Enter", "open in editor (or start solution)"),
+                row("Space", "open the Actions menu"),
+                row("e", "edit in $EDITOR"),
+                row("r", "run against examples"),
+                row("s", "submit to LeetCode"),
+                row("t / h", "toggle topics / hints"),
+                row("f", "fetch a problem by slug"),
+                row("S", "sync solved & attempted"),
+                row("x", "reset — delete solution (asks first)"),
+                row("Esc", "return a Run/Submit result to code view"),
+                text(""),
+                section("Browse All"),
+                row("←→", "previous / next page"),
+                row("Enter", "preview   ·   f  fetch into My Problems"),
+                text(""),
+                text("  press any key to close") | italic | color(kMuted),
+            });
+            Element card = window(text(" Keyboard shortcuts ") | bold | color(kAccent),
+                                  keys) | color(kBorder) | clear_under;
+            page = dbox({page, card | center});
+        }
+
+        return page;
     };
 
     auto root_renderer = Renderer(root_tabs, render);
@@ -2211,19 +2446,107 @@ void run_tui() {
         else if (idx < (int)hint_open.size()) hint_open[idx] = !hint_open[idx];
     };
 
+    // Single "Hints" toggle (replaces the old 1-9 per-hint keys): loads hints
+    // on first use, then expands all of them if any are collapsed, else
+    // collapses all. Individual hints stay independently clickable with the
+    // mouse; this is just the keyboard/menu entry point.
+    auto toggle_hints = [&]() {
+        if (my_filtered.empty()) return;
+        const auto& m = my_all[my_filtered[my_selected]];
+        if (!hints_loaded && !meta_loading.load()) { load_meta(m.folder, m.slug, false, 0); return; }
+        bool any_closed = false;
+        for (bool open : hint_open) if (!open) { any_closed = true; break; }
+        for (size_t i = 0; i < hint_open.size(); ++i) hint_open[i] = any_closed;
+    };
+
+    // Builds the contextual Actions menu for the current My-Problems selection.
+    // Only lists actions that are valid right now, so there are no silent
+    // no-ops. Each item's callback is also reachable directly via its `key`
+    // accelerator when the menu is closed (see the key handler below).
+    build_actions = [&]() -> std::vector<MenuAction> {
+        std::vector<MenuAction> a;
+        const bool has = cached_has_solution;
+        if (has) {
+            a.push_back({'e', "Edit in $EDITOR", false, [&]{ open_current_in_editor(); }});
+            a.push_back({'r', "Run against examples", false, [&]{ sol_tab = 1; run_solution_flow(); }});
+            a.push_back({'s', "Submit to LeetCode", true, [&]{ sol_tab = 2; submit_solution_flow(); }});
+            if (sol_tab != 0) a.push_back({'c', "Back to code view", false, [&]{ sol_tab = 0; }});
+        } else {
+            a.push_back({'l', "Start solution / language", false, [&]{ open_lang_dropdown(); }});
+        }
+        a.push_back({'t', "Toggle topics", false, [&]{ toggle_topics(); }});
+        a.push_back({'h', "Toggle hints", false, [&]{ toggle_hints(); }});
+        a.push_back({'f', "Fetch a problem…", false, [&]{ mode = FETCH; input_focus = 1; fetch_slug.clear(); }});
+        a.push_back({'S', "Sync solved & attempted", false, [&]{ start_sync_flow(); }});
+        if (has) a.push_back({'x', "Reset — delete solution…", true, [&]{ mode = CONFIRM_RESET; }});
+        return a;
+    };
+
     auto root = CatchEvent(root_renderer, [&](Event e) -> bool {
         // The My-Problems pane (topics/hints components) is active whenever
         // we're not editing a text field; otherwise route to search/fetch.
-        root_pane = (mode == NAV) ? 0 : 1;
+        // CONFIRM_RESET has no input, so it stays on the NAV pane.
+        root_pane = (mode == SEARCH || mode == FETCH) ? 1 : 0;
+
+        if (mode == HELP) {
+            // Any key (or click) dismisses the keymap overlay.
+            mode = NAV;
+            return true;
+        }
+
+        if (mode == CONFIRM_RESET) {
+            if (e == Event::Character('y') || e == Event::Character('Y')) {
+                reset_current_solution();
+                mode = NAV;
+                return true;
+            }
+            if (e == Event::Escape || e == Event::Character('n') || e == Event::Character('N')) {
+                mode = NAV;
+                return true;
+            }
+            return true;  // swallow all other keys while awaiting confirmation
+        }
+
+        // Actions menu: while open, it captures all input. Arrows/jk move the
+        // highlight, Enter runs it, an item's accelerator runs it directly,
+        // and Space/Esc (or a click outside) closes. Mouse hover highlights,
+        // click runs.
+        if (actions_open) {
+            auto acts = build_actions();
+            const int n = (int)acts.size();
+            actions_highlight = n ? std::clamp(actions_highlight, 0, n - 1) : 0;
+            if (e.is_mouse()) {
+                const Mouse& m = e.mouse();
+                if (m.motion == Mouse::Moved) {
+                    for (size_t i = 0; i < actions_row_boxes.size(); ++i)
+                        if (actions_row_boxes[i].Contain(m.x, m.y)) { actions_highlight = (int)i; break; }
+                    return true;
+                }
+                if (m.button == Mouse::Left && m.motion == Mouse::Pressed) {
+                    for (size_t i = 0; i < actions_row_boxes.size() && (int)i < n; ++i)
+                        if (actions_row_boxes[i].Contain(m.x, m.y)) { actions_open = false; acts[i].run(); return true; }
+                    actions_open = false;  // click outside closes
+                }
+                return true;
+            }
+            if (e == Event::ArrowUp   || e == Event::Character('k')) { if (n) actions_highlight = (actions_highlight - 1 + n) % n; return true; }
+            if (e == Event::ArrowDown || e == Event::Character('j')) { if (n) actions_highlight = (actions_highlight + 1) % n; return true; }
+            if (e == Event::Return) { actions_open = false; if (actions_highlight < n) acts[actions_highlight].run(); return true; }
+            if (e == Event::Escape || e == Event::Character(' ')) { actions_open = false; return true; }
+            for (const auto& a : acts) if (e == Event::Character(a.key)) { actions_open = false; a.run(); return true; }
+            return true;
+        }
 
         if (mode == SEARCH) {
             if (e == Event::Escape) {
+                // Esc clears the search rather than committing what was typed.
                 mode = NAV;
-                if (tab_selected == 1) {
-                    search_text.clear();
-                    if (browse_is_search) load_browse_page(0, "");
+                search_text.clear();
+                if (tab_selected == 0) {
+                    my_search.clear();  // render's lazy filter re-runs on the change
+                } else if (browse_is_search) {
+                    load_browse_page(0, "");
                 }
-                if (tab_selected == 0) my_search = search_text;
                 return true;
             }
             // Return is handled by search_input's own on_enter (set above);
@@ -2355,6 +2678,8 @@ void run_tui() {
             return true;
         }
 
+        if (e == Event::Character('?')) { mode = HELP; return true; }
+
         // The language dropdown is a small modal: while open, arrows move the
         // highlighted row instead of the My-Problems selection, Enter
         // commits it, and Esc cancels. Everything else for tab_selected==0
@@ -2388,13 +2713,12 @@ void run_tui() {
         }
 
         if (tab_selected == 0) {
-            if (e == Event::Character('f')) {
-                mode = FETCH; input_focus = 1; fetch_slug.clear(); return true;
-            }
-            if (!cached_has_solution && e == Event::Character('l')) {
-                open_lang_dropdown();
-                return true;
-            }
+            // Space opens the contextual Actions menu — the primary, always-
+            // discoverable way to reach everything below. The single-letter
+            // handlers after it are accelerators for those same actions (shown
+            // in the menu and the ? help), for people who've learned them.
+            if (e == Event::Character(' ')) { actions_open = true; actions_highlight = 0; return true; }
+
             if (e == Event::Return) {
                 // First Enter after moving the hover cursor just commits it
                 // (mirrors Browse All's select_browse_problem); a second
@@ -2408,25 +2732,36 @@ void run_tui() {
                 }
                 return true;
             }
-            if (e == Event::Character('e')) {
-                open_current_in_editor();
+
+            if (e == Event::Escape) {
+                // Esc backs out of the current state: an active filter first,
+                // then a Run/Submit result view.
+                if (!my_search.empty()) { my_search.clear(); return true; }  // render's lazy filter re-runs
+                if (sol_tab != 0) { sol_tab = 0; return true; }
                 return true;
             }
-            if (cached_has_solution && e == Event::Character('v')) {
-                sol_tab = (sol_tab + 1) % 3;
-                return true;
-            }
-            if (cached_has_solution && sol_tab == 1 && e == Event::Character('r')) {
-                run_solution_flow();
-                return true;
-            }
-            if (cached_has_solution && sol_tab == 2 && e == Event::Character('s')) {
-                submit_solution_flow();
-                return true;
-            }
+
+            // Accelerators — availability mirrors build_actions() exactly, so
+            // none of these is ever a silent no-op.
+            if (e == Event::Character('f')) { mode = FETCH; input_focus = 1; fetch_slug.clear(); return true; }
+            if (e == Event::Character('S')) { start_sync_flow(); return true; }
             if (e == Event::Character('t')) { toggle_topics(); return true; }
-            for (char c = '1'; c <= '9'; ++c) {
-                if (e == Event::Character(c)) { toggle_hint(c - '1'); return true; }
+            if (e == Event::Character('h')) { toggle_hints(); return true; }
+            if (!cached_has_solution && e == Event::Character('l')) { open_lang_dropdown(); return true; }
+            if (cached_has_solution) {
+                if (e == Event::Character('e')) { open_current_in_editor(); return true; }
+                // r/s open their tab on the first press; only once you're
+                // already on it does a second press actually run/submit.
+                if (e == Event::Character('r')) {
+                    if (sol_tab != 1) sol_tab = 1; else run_solution_flow();
+                    return true;
+                }
+                if (e == Event::Character('s')) {
+                    if (sol_tab != 2) sol_tab = 2; else submit_solution_flow();
+                    return true;
+                }
+                if (e == Event::Character('c')) { sol_tab = 0; return true; }
+                if (e == Event::Character('x')) { mode = CONFIRM_RESET; return true; }
             }
             return true;
         } else {

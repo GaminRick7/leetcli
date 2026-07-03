@@ -7,6 +7,9 @@
 #include <fstream>
 #include <iostream>
 #include <thread>
+#include <chrono>
+#include <unordered_map>
+#include <unordered_set>
 
 namespace leetcli {
 
@@ -276,6 +279,49 @@ namespace {
 
         auto json = nlohmann::json::parse(response.text);
         return json["data"]["activeDailyCodingChallengeQuestion"]["question"]["titleSlug"];
+    }
+
+    ProblemSummary fetch_daily_problem() {
+        const std::string session = get_session_cookie();
+        const std::string csrf = get_csrf_token();
+        nlohmann::json body = {
+            {"query", R"(
+                query questionOfToday {
+                    activeDailyCodingChallengeQuestion {
+                        question {
+                            frontendQuestionId: questionFrontendId
+                            title
+                            titleSlug
+                            difficulty
+                        }
+                    }
+                }
+            )"}
+        };
+
+        ProblemSummary out;  // empty slug signals failure/unavailable
+        cpr::Response r = cpr::Post(
+            cpr::Url{"https://leetcode.com/graphql"},
+            cpr::Header{
+                {"Content-Type", "application/json"},
+                {"x-csrftoken", csrf},
+                {"Cookie", "LEETCODE_SESSION=" + session + "; csrftoken=" + csrf},
+                {"Referer", "https://leetcode.com/problemset/all/"}
+            },
+            cpr::Body{body.dump()}
+        );
+        if (r.status_code != 200) return out;
+        try {
+            auto json = nlohmann::json::parse(r.text);
+            auto q = json["data"]["activeDailyCodingChallengeQuestion"]["question"];
+            out.id         = q.value("frontendQuestionId", "");
+            out.title      = q.value("title", "");
+            out.slug       = q.value("titleSlug", "");
+            out.difficulty = q.value("difficulty", "");
+        } catch (const std::exception&) {
+            out = ProblemSummary{};
+        }
+        return out;
     }
 
     ProblemDescription fetch_problem_description(const std::string &slug) {
@@ -1135,5 +1181,370 @@ namespace {
         for (const auto &hint : result.hints) {
             std::cout << "  " << count++ << ". " << hint << "\n";
         }
+    }
+
+    void reset_solution(const std::string &slug) {
+        std::string folder;
+        if (get_solution_folder(slug, folder) != 0) {
+            std::cerr << "Could not locate problem \"" << slug << "\".\n";
+            return;
+        }
+        if (!std::filesystem::exists(folder)) {
+            std::cerr << "No local folder for \"" << slug << "\" — nothing to reset.\n";
+            return;
+        }
+        int removed = 0;
+        std::error_code ec;
+        for (const auto &entry : std::filesystem::directory_iterator(folder, ec)) {
+            if (entry.path().filename().string().rfind("solution.", 0) != 0) continue;
+            std::filesystem::remove(entry.path(), ec);
+            if (!ec) {
+                std::cout << "Deleted " << entry.path().filename().string() << "\n";
+                ++removed;
+            }
+        }
+        if (removed == 0) std::cout << "No solution file to reset for \"" << slug << "\".\n";
+        else std::cout << "Reset solution for \"" << slug << "\".\n";
+    }
+
+    // ── sync: bring solved + attempted problems over locally ────────────────
+    namespace {
+        // Between requests during sync, to stay under LeetCode's rate limiting
+        // over what can be hundreds of problems.
+        constexpr int kSyncThrottleMs = 400;
+
+        // langSlug (as returned by LeetCode's submissions API) -> source file
+        // extension, including the leading dot. Falls back to ".txt" for
+        // anything unrecognised so a downloaded submission is never lost.
+        std::string lang_slug_to_ext(const std::string& lang) {
+            static const std::unordered_map<std::string, std::string> kMap = {
+                {"cpp", ".cpp"}, {"c", ".c"}, {"java", ".java"},
+                {"python", ".py"}, {"python3", ".py"}, {"pythondata", ".py"},
+                {"csharp", ".cs"}, {"javascript", ".js"}, {"typescript", ".ts"},
+                {"php", ".php"}, {"swift", ".swift"}, {"kotlin", ".kt"},
+                {"dart", ".dart"}, {"golang", ".go"}, {"ruby", ".rb"},
+                {"scala", ".scala"}, {"rust", ".rs"}, {"racket", ".rkt"},
+                {"erlang", ".erl"}, {"elixir", ".ex"}, {"bash", ".sh"},
+                {"mysql", ".sql"}, {"mssql", ".sql"}, {"oraclesql", ".sql"},
+                {"postgresql", ".sql"},
+            };
+            auto it = kMap.find(lang);
+            return it == kMap.end() ? ".txt" : it->second;
+        }
+
+        struct SyncEntry {
+            std::string slug;
+            std::string status;   // "ac" or "notac"
+        };
+
+        // Pages through the logged-in user's problem list filtered to
+        // `status_filter` ("AC" for solved, "TRIED" for attempted-but-unsolved).
+        // Only keeps rows whose per-question status matches `keep_status`
+        // ("ac"/"notac"), so a mis-applied server filter can't pull in problems
+        // the user never touched. Returns false and sets `err` on failure.
+        bool fetch_status_problems(const std::string& status_filter, const std::string& keep_status,
+                                   std::vector<SyncEntry>& out, std::string& err) {
+            const std::string session = get_session_cookie();
+            const std::string csrf = get_csrf_token();
+            const int page_size = 100;
+            int skip = 0;
+            int total = 0;
+            do {
+                nlohmann::json filters = { {"status", status_filter} };
+                nlohmann::json body = {
+                    {"operationName", "problemsetQuestionList"},
+                    {"query", R"(
+                        query problemsetQuestionList($categorySlug: String, $limit: Int, $skip: Int, $filters: QuestionListFilterInput) {
+                            problemsetQuestionList: questionList(
+                                categorySlug: $categorySlug
+                                limit: $limit
+                                skip: $skip
+                                filters: $filters
+                            ) {
+                                total: totalNum
+                                questions: data {
+                                    titleSlug
+                                    status
+                                }
+                            }
+                        }
+                    )"},
+                    {"variables", {
+                        {"categorySlug", ""}, {"skip", skip}, {"limit", page_size}, {"filters", filters}
+                    }}
+                };
+
+                cpr::Response r = cpr::Post(
+                    cpr::Url{"https://leetcode.com/graphql"},
+                    cpr::Header{
+                        {"Content-Type", "application/json"},
+                        {"x-csrftoken", csrf},
+                        {"Cookie", "LEETCODE_SESSION=" + session + "; csrftoken=" + csrf},
+                        {"Referer", "https://leetcode.com/problemset/all/"}
+                    },
+                    cpr::Body{body.dump()}
+                );
+                if (r.status_code != 200) {
+                    err = "HTTP " + std::to_string(r.status_code);
+                    return false;
+                }
+
+                int returned = 0;
+                try {
+                    auto json = nlohmann::json::parse(r.text);
+                    auto list = json["data"]["problemsetQuestionList"];
+                    total = list["total"].get<int>();
+                    for (const auto& q : list["questions"]) {
+                        ++returned;
+                        SyncEntry e;
+                        e.slug = q.value("titleSlug", "");
+                        e.status = json_str(q, "status");
+                        if (e.slug.empty()) continue;
+                        if (e.status != keep_status) continue;
+                        out.push_back(std::move(e));
+                    }
+                } catch (const std::exception& ex) {
+                    err = std::string("Parse error: ") + ex.what();
+                    return false;
+                }
+
+                skip += page_size;
+                if (returned == 0) break;  // guard against a filter that returns an inflated total
+                std::this_thread::sleep_for(std::chrono::milliseconds(kSyncThrottleMs));
+            } while (skip < total);
+            return true;
+        }
+
+        // Reads a JSON field that may be either an epoch-seconds string or a
+        // number (LeetCode returns submission timestamps as strings). 0 = absent.
+        long long json_epoch(const nlohmann::json& obj, const std::string& key) {
+            auto it = obj.find(key);
+            if (it == obj.end() || it->is_null()) return 0;
+            if (it->is_string()) { try { return std::stoll(it->get<std::string>()); } catch (...) { return 0; } }
+            if (it->is_number()) return it->get<long long>();
+            return 0;
+        }
+
+        struct SubmissionMeta {
+            std::string id;
+            std::string lang;        // langSlug, e.g. "cpp"
+            long long timestamp = 0; // epoch seconds of the submission
+            bool found = false;
+        };
+
+        // Fetches metadata (id/lang/timestamp) of the user's most recent
+        // submission for `slug` — the newest Accepted one if `accepted_only`,
+        // else the newest of any verdict. Returns false only on transport error;
+        // `out.found` stays false when the user has no matching submission.
+        bool fetch_latest_submission_meta(const std::string& slug, bool accepted_only,
+                                          SubmissionMeta& out) {
+            const std::string session = get_session_cookie();
+            const std::string csrf = get_csrf_token();
+            const cpr::Header headers{
+                {"Content-Type", "application/json"},
+                {"x-csrftoken", csrf},
+                {"Cookie", "LEETCODE_SESSION=" + session + "; csrftoken=" + csrf},
+                {"Referer", "https://leetcode.com/problems/" + slug + "/submissions/"},
+                {"User-Agent", kBrowserUserAgent}
+            };
+            nlohmann::json list_body = {
+                {"operationName", "submissionList"},
+                {"query", R"(
+                    query submissionList($offset: Int!, $limit: Int!, $questionSlug: String!) {
+                        questionSubmissionList(offset: $offset, limit: $limit, questionSlug: $questionSlug) {
+                            submissions { id statusDisplay lang timestamp }
+                        }
+                    }
+                )"},
+                {"variables", { {"offset", 0}, {"limit", 20}, {"questionSlug", slug} }}
+            };
+            cpr::Response lr = cpr::Post(cpr::Url{"https://leetcode.com/graphql"}, headers,
+                                         cpr::Body{list_body.dump()});
+            if (lr.status_code != 200) return false;
+            try {
+                auto j = nlohmann::json::parse(lr.text);
+                auto node = j["data"]["questionSubmissionList"];
+                if (node.is_null()) return true;
+                for (const auto& s : node["submissions"]) {   // newest first
+                    if (accepted_only && json_str(s, "statusDisplay") != "Accepted") continue;
+                    out.id = json_str(s, "id");
+                    out.lang = json_str(s, "lang");
+                    out.timestamp = json_epoch(s, "timestamp");
+                    out.found = !out.id.empty();
+                    break;
+                }
+            } catch (const std::exception&) {
+                return false;
+            }
+            return true;
+        }
+
+        // Fetches the source code of a specific submission by id. Returns false
+        // on transport error; `out_code` empty on a null/missing detail.
+        bool fetch_submission_code(const std::string& slug, const std::string& submission_id,
+                                   std::string& out_code) {
+            long long id_num = 0;
+            try { id_num = std::stoll(submission_id); } catch (...) { return true; }
+            const std::string session = get_session_cookie();
+            const std::string csrf = get_csrf_token();
+            const cpr::Header headers{
+                {"Content-Type", "application/json"},
+                {"x-csrftoken", csrf},
+                {"Cookie", "LEETCODE_SESSION=" + session + "; csrftoken=" + csrf},
+                {"Referer", "https://leetcode.com/problems/" + slug + "/submissions/"},
+                {"User-Agent", kBrowserUserAgent}
+            };
+            nlohmann::json det_body = {
+                {"operationName", "submissionDetails"},
+                {"query", R"(
+                    query submissionDetails($submissionId: Int!) {
+                        submissionDetails(submissionId: $submissionId) { code }
+                    }
+                )"},
+                {"variables", { {"submissionId", id_num} }}
+            };
+            cpr::Response dr = cpr::Post(cpr::Url{"https://leetcode.com/graphql"}, headers,
+                                         cpr::Body{det_body.dump()});
+            if (dr.status_code != 200) return false;
+            try {
+                auto j = nlohmann::json::parse(dr.text);
+                auto det = j["data"]["submissionDetails"];
+                if (det.is_null()) return true;
+                out_code = json_str(det, "code");
+            } catch (const std::exception&) {
+                return false;
+            }
+            return true;
+        }
+
+        // All solution.<ext> files currently in `folder`.
+        std::vector<std::string> list_solution_files(const std::string& folder) {
+            std::vector<std::string> out;
+            std::error_code ec;
+            for (const auto& e : std::filesystem::directory_iterator(folder, ec)) {
+                if (e.path().filename().string().rfind("solution.", 0) == 0)
+                    out.push_back(e.path().string());
+            }
+            return out;
+        }
+
+        // Last-modified time of `path` in epoch seconds (0 on error). Uses the
+        // portable C++17 approximation for file_time_type -> system_clock, which
+        // is accurate to well within the granularity we compare at (seconds).
+        long long file_mtime_epoch(const std::string& path) {
+            std::error_code ec;
+            auto ft = std::filesystem::last_write_time(path, ec);
+            if (ec) return 0;
+            auto sctp = std::chrono::time_point_cast<std::chrono::system_clock::duration>(
+                ft - std::filesystem::file_time_type::clock::now() + std::chrono::system_clock::now());
+            return std::chrono::duration_cast<std::chrono::seconds>(sctp.time_since_epoch()).count();
+        }
+    }  // namespace
+
+    void sync_problems(int limit, const std::function<void(const SyncProgress&)>& on_progress) {
+        SyncProgress prog;
+        auto emit = [&]() { if (on_progress) on_progress(prog); };
+
+        if (get_session_cookie().empty()) {
+            prog.error = "Not logged in. Run `leetcli login` first.";
+            prog.finished = true;
+            emit();
+            return;
+        }
+
+        // 1. Enumerate solved, then attempted (dedup — solved wins on overlap).
+        std::vector<SyncEntry> solved, attempted;
+        std::string err;
+        if (!fetch_status_problems("AC", "ac", solved, err)) {
+            prog.error = "Failed to list solved problems: " + err;
+            prog.finished = true; emit(); return;
+        }
+        if (!fetch_status_problems("TRIED", "notac", attempted, err)) {
+            prog.error = "Failed to list attempted problems: " + err;
+            prog.finished = true; emit(); return;
+        }
+
+        std::vector<SyncEntry> all;
+        std::unordered_set<std::string> seen;
+        for (auto& e : solved)    if (seen.insert(e.slug).second) all.push_back(e);
+        for (auto& e : attempted) if (seen.insert(e.slug).second) all.push_back(e);
+
+        if (limit > 0 && static_cast<int>(all.size()) > limit) all.resize(limit);
+        prog.total = static_cast<int>(all.size());
+        emit();  // total is now known — lets the UI show the denominator up front
+
+        // 2. Process each problem.
+        for (const auto& e : all) {
+            prog.current = e.slug;
+
+            std::string folder;
+            if (get_solution_folder(e.slug, folder) != 0) {
+                ++prog.done; prog.last_result = "skipped (lookup failed)"; emit();
+                std::this_thread::sleep_for(std::chrono::milliseconds(kSyncThrottleMs));
+                continue;
+            }
+
+            bool have_folder = std::filesystem::exists(folder + "/README.md");
+            if (!have_folder) {
+                fetch_problem(e.slug, "");  // writes README/description/testcases/…; no README if Premium-locked
+                have_folder = std::filesystem::exists(folder + "/README.md");
+            }
+            if (!have_folder) {
+                ++prog.done; prog.last_result = "skipped (premium/unavailable)"; emit();
+                std::this_thread::sleep_for(std::chrono::milliseconds(kSyncThrottleMs));
+                continue;
+            }
+
+            write_lines_file(folder + "/.status", {e.status});
+
+            std::string result = (e.status == "ac") ? "solved" : "attempted";
+            const bool accepted_only = (e.status == "ac");
+            std::vector<std::string> existing = list_solution_files(folder);
+
+            // Look up the latest submission's metadata. We overwrite the local
+            // solution only when LeetCode's submission is strictly newer than
+            // the local file — so a submission made after the last sync gets
+            // pulled, but local edits (which bump the file's mtime) are kept.
+            SubmissionMeta meta;
+            bool meta_ok = fetch_latest_submission_meta(e.slug, accepted_only, meta);
+
+            if (existing.empty()) {
+                // No local code yet — take whatever the latest submission is.
+                if (meta_ok && meta.found) {
+                    std::string code;
+                    if (fetch_submission_code(e.slug, meta.id, code) && !code.empty())
+                        write_solution_file(folder + "/solution" + lang_slug_to_ext(meta.lang), code);
+                    else result += " (no code)";
+                } else {
+                    result += " (no code)";
+                }
+            } else {
+                long long local_ts = 0;
+                for (const auto& f : existing) local_ts = std::max(local_ts, file_mtime_epoch(f));
+                if (meta_ok && meta.found && meta.timestamp > local_ts) {
+                    std::string code;
+                    if (fetch_submission_code(e.slug, meta.id, code) && !code.empty()) {
+                        // Replace any older solution files (the new submission's
+                        // language may differ from what's on disk).
+                        for (const auto& f : existing) { std::error_code ec; std::filesystem::remove(f, ec); }
+                        write_solution_file(folder + "/solution" + lang_slug_to_ext(meta.lang), code);
+                        result += " (updated to newer submission)";
+                    } else {
+                        result += " (kept existing code)";
+                    }
+                } else {
+                    result += " (kept existing code)";
+                }
+            }
+
+            ++prog.done;
+            prog.last_result = result;
+            emit();
+            std::this_thread::sleep_for(std::chrono::milliseconds(kSyncThrottleMs));
+        }
+
+        prog.current.clear();
+        prog.finished = true;
+        emit();
     }
 }

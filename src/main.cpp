@@ -189,6 +189,41 @@ int main(int argc, char **argv) {
         leetcli::give_hint(slug, lang_override);
         return 0;
     }
+    if (command == "reset") {
+        if (argc < 3) {
+            std::cerr << "Usage: leetcli reset <slug>\n";
+            return 1;
+        }
+        std::string slug = argv[2];
+        if (slug == "daily") {
+            slug = leetcli::get_daily_question_slug();
+        }
+        leetcli::reset_solution(slug);
+        return 0;
+    }
+    if (command == "sync") {
+        int limit = 0;  // 0 = all
+        for (int i = 2; i < argc; ++i) {
+            std::string arg = argv[i];
+            if (arg.rfind("--limit=", 0) == 0) limit = std::atoi(arg.c_str() + 8);
+        }
+        std::cout << "Fetching your solved & attempted problem list (this can take a while)...\n";
+        leetcli::sync_problems(limit, [](const leetcli::SyncProgress& p) {
+            if (!p.error.empty()) {
+                std::cerr << p.error << "\n";
+                return;
+            }
+            if (p.finished) {
+                std::cout << "Sync complete: " << p.done << " problem(s) processed.\n";
+                return;
+            }
+            if (p.total > 0 && !p.current.empty()) {
+                std::cout << "[" << p.done << "/" << p.total << "] " << p.current
+                          << " - " << p.last_result << "\n";
+            }
+        });
+        return 0;
+    }
     if (command == "help") {
         std::cout << "leetcli - LeetCode CLI Tool\n\n"
                   << "Main Usage:\n"
@@ -200,6 +235,8 @@ int main(int argc, char **argv) {
                   << "  leetcli solve <slug> [--lang=...]   Open the solution file in your default editor\n"
                   << "  leetcli list                        List all fetched problems\n"
                   << "  leetcli login                       Set your LEETCODE_SESSION and CSRF token\n"
+                  << "  leetcli sync [--limit=N]            Download all your solved & attempted problems (with your submitted code) locally\n"
+                  << "  leetcli reset <slug>                Delete your local solution file for a problem\n"
                   << "  leetcli run <slug>  [--lang=...]    Run your solution against LeetCode testcases\n"
                   << "  leetcli submit <slug> [--lang=...]  Submit your solution to LeetCode\n"
                   << "  leetcli runtime <slug> [--lang=...] Analyze time/space complexity using Gemini\n"

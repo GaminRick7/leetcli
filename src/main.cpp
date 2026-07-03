@@ -191,7 +191,7 @@ int main(int argc, char **argv) {
     }
     if (command == "help") {
         std::cout << "leetcli - LeetCode CLI Tool\n\n"
-                  << "Main usage:\n"
+                  << "Main Usage:\n"
                   << "  leetcli                              Launch the interactive terminal UI (recommended)\n"
                   << "  leetcli --interactive                Same as running leetcli with no arguments\n\n"
                   << "Other commands:\n"

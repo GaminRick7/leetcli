@@ -191,7 +191,10 @@ int main(int argc, char **argv) {
     }
     if (command == "help") {
         std::cout << "leetcli - LeetCode CLI Tool\n\n"
-                  << "Usage:\n"
+                  << "Main usage:\n"
+                  << "  leetcli                              Launch the interactive terminal UI (recommended)\n"
+                  << "  leetcli --interactive                Same as running leetcli with no arguments\n\n"
+                  << "Other commands:\n"
                   << "  leetcli init                        Initialize the problems directory in your current directory\n"
                   << "  leetcli fetch <slug> [--lang=...]   Fetch a problem by slug or use 'daily' for the daily question (langs: cpp, python3, java)\n"
                   << "  leetcli solve <slug> [--lang=...]   Open the solution file in your default editor\n"
@@ -204,7 +207,6 @@ int main(int argc, char **argv) {
                   << "  leetcli hints <slug>                Gets the hints for the given problem in leetcode\n"
                   << "  leetcli topics <slug>               Gets the topics for the given problem in leetcode\n"
                   << "  leetcli config set-gemini-key <key> Set your Gemini API key\n"
-                  << "  leetcli --interactive               Open the interactive terminal UI\n"
                   << "  leetcli help                        Show this help message\n";
         return 0;
     }

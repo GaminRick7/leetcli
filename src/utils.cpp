@@ -506,6 +506,36 @@ Elements html_to_ftxui(const std::string& html, ImageCache& cache,
         return filename.substr(dot_pos + 1);
     }
 
+    // The canonical langSlug<->extension table, mirroring the TUI's
+    // kLangOptions (tui.cpp) so the CLI's `start`/`run`/`submit` accept the
+    // same 18 languages. Extensions include the leading dot, matching what
+    // write_starter_solution() expects for its `ext` argument.
+    static const std::vector<std::pair<std::string, std::string>>& lang_ext_table() {
+        static const std::vector<std::pair<std::string, std::string>> table = {
+            {"cpp", ".cpp"},   {"java", ".java"},   {"python3", ".py"},
+            {"c", ".c"},       {"csharp", ".cs"},   {"javascript", ".js"},
+            {"typescript", ".ts"}, {"php", ".php"}, {"swift", ".swift"},
+            {"kotlin", ".kt"}, {"dart", ".dart"},   {"golang", ".go"},
+            {"ruby", ".rb"},   {"scala", ".scala"}, {"rust", ".rs"},
+            {"racket", ".rkt"},{"erlang", ".erl"},  {"elixir", ".ex"},
+        };
+        return table;
+    }
+
+    std::string get_extension_for_lang(const std::string& lang) {
+        for (const auto& [id, ext] : lang_ext_table())
+            if (id == lang) return ext;
+        return "";
+    }
+
+    std::string get_lang_for_extension(const std::string& ext) {
+        // Accept the extension with or without a leading dot.
+        std::string dotted = (!ext.empty() && ext[0] == '.') ? ext : "." + ext;
+        for (const auto& [id, e] : lang_ext_table())
+            if (e == dotted) return id;
+        return "";
+    }
+
     static std::filesystem::path get_home() {
         if (auto *h = std::getenv("HOME"); h && *h) return h;
         if (auto *u = std::getenv("USERPROFILE"); u && *u) return u;
@@ -717,6 +747,23 @@ Elements html_to_ftxui(const std::string& html, ImageCache& cache,
         out << config.dump(4);
     }
 
+    // Read-merge-write a single scalar key into config.json (mirrors
+    // set_gemini_key / set_editor_preference), then confirm on stdout.
+    static void set_config_key(const std::string& key, const std::string& value) {
+        std::filesystem::path config_path = get_home() / ".leetcli/config.json";
+        nlohmann::json config;
+        std::ifstream in(config_path);
+        if (in) in >> config;
+        config[key] = value;
+        std::ofstream out(config_path);
+        out << config.dump(2);
+        std::cout << "✅ Set " << key << " = " << value << "\n";
+    }
+
+    void set_language_preference(const std::string& lang) { set_config_key("lang", lang); }
+    void set_problems_dir(const std::string& dir)          { set_config_key("problems_dir", dir); }
+    void set_image_rendering_pref(const std::string& mode) { set_config_key("image_rendering", mode); }
+
     void launch_in_editor(const std::string &path) {
         std::string editor = get_preferred_editor();
         #ifdef _WIN32
@@ -824,6 +871,12 @@ Elements html_to_ftxui(const std::string& html, ImageCache& cache,
 
         auto json = nlohmann::json::parse(r.text);
         auto question = json["data"]["question"];
+        // A bad/unknown slug comes back as question == null; bail cleanly
+        // instead of throwing on the field accesses below.
+        if (question.is_null()) {
+            std::cerr << "Problem not found: \"" << slug << "\"\n";
+            return 1;
+        }
         std::string id = question["questionId"];
         std::string title = question["title"];
         std::string safe_title = std::regex_replace(title, std::regex("[\\\\/:*?\"<>|]"), "");
@@ -864,6 +917,12 @@ Elements html_to_ftxui(const std::string& html, ImageCache& cache,
 
         auto json = nlohmann::json::parse(r.text);
         auto question = json["data"]["question"];
+        // A bad/unknown slug comes back as question == null; bail cleanly
+        // instead of throwing on the field accesses below.
+        if (question.is_null()) {
+            std::cerr << "Problem not found: \"" << slug << "\"\n";
+            return 1;
+        }
         std::string id = question["questionId"];
         std::string title = question["title"];
         std::string safe_title = std::regex_replace(title, std::regex("[\\\\/:*?\"<>|]"), "");
@@ -945,11 +1004,61 @@ Elements html_to_ftxui(const std::string& html, ImageCache& cache,
 
         return testcases;
     }
+    // Prints the current config, redacting secret values (session/csrf/gemini)
+    // down to a set/unset indicator.
+    static void show_config() {
+        std::filesystem::path config_path = get_home() / ".leetcli/config.json";
+        std::ifstream in(config_path);
+        if (!in) {
+            std::cerr << "No config file found. Run `leetcli init` first.\n";
+            return;
+        }
+        nlohmann::json config;
+        in >> config;
+
+        static const std::vector<std::string> secret_keys = {
+            "leetcode_session", "csrf_token", "gemini_key"};
+        std::cout << "Config (" << config_path.string() << "):\n";
+        for (auto it = config.begin(); it != config.end(); ++it) {
+            bool secret = std::find(secret_keys.begin(), secret_keys.end(), it.key()) != secret_keys.end();
+            std::cout << "  " << it.key() << " = ";
+            if (secret) {
+                bool set = it.value().is_string() && !it.value().get<std::string>().empty();
+                std::cout << (set ? "<set>" : "<unset>");
+            } else if (it.value().is_string()) {
+                std::cout << it.value().get<std::string>();
+            } else {
+                std::cout << it.value().dump();
+            }
+            std::cout << "\n";
+        }
+    }
+
     void handle_config_command(const std::vector<std::string> &args) {
-        if (args.size() == 3 && args[1] == "set-gemini-key") {
+        // args[0] == "config"
+        const std::string sub = args.size() > 1 ? args[1] : "";
+        if (sub == "show") {
+            show_config();
+        } else if (sub == "set-gemini-key" && args.size() == 3) {
             set_gemini_key(args[2]);
+        } else if (sub == "set-lang" && args.size() == 3) {
+            set_language_preference(args[2]);
+        } else if (sub == "set-editor" && args.size() == 3) {
+            set_editor_preference(args[2]);
+            std::cout << "✅ Set editor = " << args[2] << "\n";
+        } else if (sub == "set-problems-dir" && args.size() == 3) {
+            set_problems_dir(args[2]);
+        } else if (sub == "set-image-rendering" && args.size() == 3 &&
+                   (args[2] == "auto" || args[2] == "off")) {
+            set_image_rendering_pref(args[2]);
         } else {
-            std::cerr << "Usage: leetcli config set-gemini-key <your-api-key>\n";
+            std::cerr << "Usage:\n"
+                      << "  leetcli config show\n"
+                      << "  leetcli config set-gemini-key <api-key>\n"
+                      << "  leetcli config set-lang <langSlug>\n"
+                      << "  leetcli config set-editor <command>\n"
+                      << "  leetcli config set-problems-dir <path>\n"
+                      << "  leetcli config set-image-rendering <auto|off>\n";
         }
     }
 

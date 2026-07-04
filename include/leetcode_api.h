@@ -150,13 +150,23 @@ namespace leetcli {
     void sync_problems(int limit, const std::function<void(const SyncProgress&)>& on_progress = {});
 
     std::string get_daily_question_slug();
+    // Resolves a problem's displayed number (frontend question id, e.g. 1 for
+    // Two Sum) to its titleSlug. Returns "" if no such problem exists.
+    std::string get_slug_by_number(int number);
     std::string fetch_problem(const std::string& slug, const std::string& lang_override);
     std::string read_question_id_from_readme(const std::string& path);
     void solve_problem(const std::string& slug, const std::string &lang_override);
     void list_fetched_problems();
+    // Prints one page (100) of the LeetCode catalog, optionally filtered by
+    // keyword. `page` is 1-indexed. Wraps fetch_problem_page for the CLI.
+    void browse_problems(int page, const std::string& keyword);
+    // Prints today's daily challenge (title/difficulty/slug). Wraps
+    // fetch_daily_problem for the CLI.
+    void show_daily();
+    // Writes starter code for `lang_override` (or the configured default) into
+    // an already-fetched problem's folder. Wraps write_starter_solution.
+    void start_solution(const std::string& slug, const std::string& lang_override);
     void run_tests(const std::string& slug, const std::string &lang_override);
-    void run_problem(const std::string& slug, const std::string& lang, const std::string& question_id,
-    const std::string& code, const std::string& test_input, const std::string& session, const std::string& csrf);
     void submit_solution(const std::string& slug, const std::string &lang_override);
     void handle_config_command(const std::vector<std::string>& args);
     void analyze_runtime(const std::string& slug, const std::string &lang_override);

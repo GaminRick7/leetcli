@@ -124,6 +124,7 @@ const EditorOption kKnownEditors[] = {
     {"vim",           "Vim"},
     {"code",          "VS Code"},
     {"code-insiders", "VS Code Insiders"},
+    {"cursor",        "Cursor"},
     {"subl",          "Sublime Text"},
     {"emacs",         "Emacs"},
     {"hx",            "Helix"},

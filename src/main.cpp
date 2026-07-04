@@ -25,7 +25,7 @@ int main(int argc, char **argv) {
     if (command == "fetch") {
 
         if (argc < 3) {
-            std::cerr << "Usage: leetcli fetch <slug> [--lang=cpp|python3|java]\n";
+            std::cerr << "Usage: leetcli fetch <slug|number> [--lang=cpp|python3|java]\n";
             return 1;
         }
 
@@ -33,6 +33,11 @@ int main(int argc, char **argv) {
 
         if (slug == "daily") {
             slug = leetcli::get_daily_question_slug();
+        } else if (!slug.empty() &&
+                   slug.find_first_not_of("0123456789") == std::string::npos) {
+            // A purely numeric argument is a problem number (e.g. `fetch 1`).
+            slug = leetcli::get_slug_by_number(std::stoi(slug));
+            if (slug.empty()) return 1;
         }
 
         std::string lang_override;
@@ -107,12 +112,16 @@ int main(int argc, char **argv) {
     }
     if (command == "submit") {
         if (argc < 3) {
-            std::cerr << "Usage: leetcli submit <slug> [--lang=cpp|python3|java]\n";
+            std::cerr << "Usage: leetcli submit <slug|number> [--lang=cpp|python3|java]\n";
             return 1;
         }
         std::string slug = argv[2];
         if (slug == "daily") {
             slug = leetcli::get_daily_question_slug();
+        } else if (!slug.empty() &&
+                   slug.find_first_not_of("0123456789") == std::string::npos) {
+            slug = leetcli::get_slug_by_number(std::stoi(slug));
+            if (slug.empty()) return 1;
         }
         std::string lang_override;
 
@@ -128,12 +137,16 @@ int main(int argc, char **argv) {
     }
     if (command == "run") {
         if (argc < 3) {
-            std::cerr << "Usage: leetcli run <slug> [--lang=cpp|python3|java]\n";
+            std::cerr << "Usage: leetcli run <slug|number> [--lang=cpp|python3|java]\n";
             return 1;
         }
         std::string slug = argv[2];
         if (slug == "daily") {
             slug = leetcli::get_daily_question_slug();
+        } else if (!slug.empty() &&
+                   slug.find_first_not_of("0123456789") == std::string::npos) {
+            slug = leetcli::get_slug_by_number(std::stoi(slug));
+            if (slug.empty()) return 1;
         }
         std::string lang_override;
 
@@ -224,6 +237,40 @@ int main(int argc, char **argv) {
         });
         return 0;
     }
+    if (command == "browse" || command == "search") {
+        int page = 1;
+        std::string keyword;
+        // `search <kw>` is a thin alias: the first non-flag arg is the keyword.
+        for (int i = 2; i < argc; ++i) {
+            std::string arg = argv[i];
+            if (arg.rfind("--page=", 0) == 0) page = std::atoi(arg.c_str() + 7);
+            else if (arg.rfind("--search=", 0) == 0) keyword = arg.substr(9);
+            else if (command == "search" && arg.rfind("--", 0) != 0 && keyword.empty()) keyword = arg;
+        }
+        leetcli::browse_problems(page, keyword);
+        return 0;
+    }
+    if (command == "daily") {
+        leetcli::show_daily();
+        return 0;
+    }
+    if (command == "start") {
+        if (argc < 3) {
+            std::cerr << "Usage: leetcli start <slug> [--lang=cpp|python3|java|...]\n";
+            return 1;
+        }
+        std::string slug = argv[2];
+        if (slug == "daily") {
+            slug = leetcli::get_daily_question_slug();
+        }
+        std::string lang_override;
+        for (int i = 3; i < argc; ++i) {
+            std::string arg = argv[i];
+            if (arg.rfind("--lang=", 0) == 0) lang_override = arg.substr(7);
+        }
+        leetcli::start_solution(slug, lang_override);
+        return 0;
+    }
     if (command == "help") {
         std::cout << "leetcli - LeetCode CLI Tool\n\n"
                   << "Main Usage:\n"
@@ -231,19 +278,22 @@ int main(int argc, char **argv) {
                   << "  leetcli --interactive                Same as running leetcli with no arguments\n\n"
                   << "Other commands:\n"
                   << "  leetcli init                        Initialize the problems directory in your current directory\n"
-                  << "  leetcli fetch <slug> [--lang=...]   Fetch a problem by slug or use 'daily' for the daily question (langs: cpp, python3, java)\n"
+                  << "  leetcli fetch <slug|number> [--lang=...]  Fetch a problem by slug, number (e.g. 1), or 'daily' (langs: cpp, python3, java)\n"
+                  << "  leetcli browse [--page=N] [--search=kw]  Browse the LeetCode catalog, 100 per page (alias: search <kw>)\n"
+                  << "  leetcli daily                       Show today's daily challenge\n"
+                  << "  leetcli start <slug> [--lang=...]   Write starter code for a fetched problem (18 languages supported)\n"
                   << "  leetcli solve <slug> [--lang=...]   Open the solution file in your default editor\n"
-                  << "  leetcli list                        List all fetched problems\n"
+                  << "  leetcli list                        List all fetched problems with difficulty & solved/attempted status\n"
                   << "  leetcli login                       Set your LEETCODE_SESSION and CSRF token\n"
                   << "  leetcli sync [--limit=N]            Download all your solved & attempted problems (with your submitted code) locally\n"
                   << "  leetcli reset <slug>                Delete your local solution file for a problem\n"
-                  << "  leetcli run <slug>  [--lang=...]    Run your solution against LeetCode testcases\n"
-                  << "  leetcli submit <slug> [--lang=...]  Submit your solution to LeetCode\n"
+                  << "  leetcli run <slug>  [--lang=...]    Run your solution against example testcases (per-testcase pass/fail)\n"
+                  << "  leetcli submit <slug> [--lang=...]  Submit your solution (verdict + runtime/memory percentiles)\n"
                   << "  leetcli runtime <slug> [--lang=...] Analyze time/space complexity using Gemini\n"
                   << "  leetcli hint <slug> [--lang=...]    Ask Gemini for a helpful hint based on your solution progress\n"
                   << "  leetcli hints <slug>                Gets the hints for the given problem in leetcode\n"
                   << "  leetcli topics <slug>               Gets the topics for the given problem in leetcode\n"
-                  << "  leetcli config set-gemini-key <key> Set your Gemini API key\n"
+                  << "  leetcli config <subcommand>         Configure leetcli (show | set-gemini-key | set-lang | set-editor | set-problems-dir | set-image-rendering)\n"
                   << "  leetcli help                        Show this help message\n";
         return 0;
     }

@@ -8,6 +8,7 @@
 #include <iostream>
 #include <thread>
 #include <chrono>
+#include <algorithm>
 #include <unordered_map>
 #include <unordered_set>
 
@@ -281,6 +282,33 @@ namespace {
         return json["data"]["activeDailyCodingChallengeQuestion"]["question"]["titleSlug"];
     }
 
+    std::string get_slug_by_number(int number) {
+        // The public problem list maps each problem's displayed number
+        // (frontend_question_id) to its titleSlug. It's unauthenticated and
+        // returns every problem in one response.
+        cpr::Response r = cpr::Get(
+            cpr::Url{"https://leetcode.com/api/problems/all/"},
+            cpr::Header{{"User-Agent", kBrowserUserAgent}}
+        );
+        if (r.status_code != 200) {
+            std::cerr << "Failed to fetch problem list: HTTP " << r.status_code << "\n";
+            return "";
+        }
+        try {
+            auto json = nlohmann::json::parse(r.text);
+            for (const auto& pair : json.value("stat_status_pairs", nlohmann::json::array())) {
+                const auto& stat = pair["stat"];
+                if (stat.value("frontend_question_id", -1) == number)
+                    return stat.value("question__title_slug", "");
+            }
+        } catch (const std::exception& e) {
+            std::cerr << "Failed to parse problem list: " << e.what() << "\n";
+            return "";
+        }
+        std::cerr << "No problem found with number " << number << "\n";
+        return "";
+    }
+
     ProblemSummary fetch_daily_problem() {
         const std::string session = get_session_cookie();
         const std::string csrf = get_csrf_token();
@@ -539,6 +567,28 @@ namespace {
         }
     }
 
+    namespace {
+        // Reads the first line of a sidecar file (e.g. .difficulty, .status),
+        // trimming trailing whitespace/newlines. Returns "" if absent.
+        std::string read_first_line(const std::filesystem::path& path) {
+            std::ifstream in(path);
+            if (!in) return "";
+            std::string line;
+            std::getline(in, line);
+            while (!line.empty() && (line.back() == '\r' || line.back() == '\n' || line.back() == ' '))
+                line.pop_back();
+            return line;
+        }
+
+        // True if the folder holds any solution.<ext> file.
+        bool folder_has_solution(const std::filesystem::path& folder) {
+            std::error_code ec;
+            for (const auto& e : std::filesystem::directory_iterator(folder, ec))
+                if (e.path().filename().string().rfind("solution.", 0) == 0) return true;
+            return false;
+        }
+    }
+
     void list_fetched_problems() {
         std::string problems_dir = get_problems_dir();
 
@@ -553,159 +603,144 @@ namespace {
             if (!entry.is_directory()) continue;
 
             std::string folder_name = entry.path().filename().string();
-            std::string solution_path = entry.path().string() + "/solution.cpp";
-            std::string status = std::filesystem::exists(solution_path) ? "[💾]" : "[ ]";
 
-            std::cout << "  " << status << " " << folder_name << "\n";
+            // Solution marker: 💾 if a solution.<ext> exists, blank otherwise.
+            std::string sol = folder_has_solution(entry.path()) ? "💾" : "  ";
+
+            // Solved/attempted marker from the same sidecars the TUI reads:
+            // .solved ("1") or .status == "ac" => solved; .status == "notac"
+            // => attempted.
+            std::string status_val = read_first_line(entry.path() / ".status");
+            bool solved = !read_first_line(entry.path() / ".solved").empty() || status_val == "ac";
+            bool attempted = status_val == "notac";
+            std::string mark = solved ? "✓" : (attempted ? "•" : " ");
+
+            // Difficulty badge from .difficulty (blank if not cached).
+            std::string diff = read_first_line(entry.path() / ".difficulty");
+            std::string badge = diff.empty() ? std::string(8, ' ')
+                                             : "[" + diff + std::string(diff.size() < 6 ? 6 - diff.size() : 0, ' ') + "]";
+
+            std::cout << "  " << mark << " " << sol << " " << badge << " " << folder_name << "\n";
+        }
+    }
+
+    void browse_problems(int page, const std::string& keyword) {
+        if (page < 1) page = 1;
+        ProblemPage pg = fetch_problem_page((page - 1) * 100, keyword);
+        if (!pg.error.empty()) {
+            std::cerr << "Failed to browse problems: " << pg.error << "\n";
+            return;
+        }
+        if (pg.problems.empty()) {
+            std::cout << "No problems found"
+                      << (keyword.empty() ? "" : " for \"" + keyword + "\"") << ".\n";
+            return;
+        }
+        for (const auto& p : pg.problems) {
+            std::string diff = p.difficulty.empty() ? "" : "[" + p.difficulty + "]";
+            std::cout << "  " << p.id << "\t" << diff << "\t" << p.title
+                      << "  (" << p.slug << ")\n";
+        }
+        int first = (page - 1) * 100 + 1;
+        int last = first + static_cast<int>(pg.problems.size()) - 1;
+        std::cout << "\nShowing " << first << "-" << last << " of " << pg.total
+                  << ".  Use --page=" << (page + 1) << " for the next page.\n";
+    }
+
+    void show_daily() {
+        ProblemSummary d = fetch_daily_problem();
+        if (d.slug.empty()) {
+            std::cerr << "Could not fetch today's daily challenge.\n";
+            return;
+        }
+        std::cout << "Today's Daily Challenge\n";
+        std::cout << "  " << d.id << ". " << d.title << "\n";
+        if (!d.difficulty.empty()) std::cout << "  Difficulty: " << d.difficulty << "\n";
+        std::cout << "  Slug:       " << d.slug << "\n";
+        std::cout << "\nRun `leetcli fetch daily` to download it.\n";
+    }
+
+    void start_solution(const std::string& slug, const std::string& lang_override) {
+        std::string lang = lang_override.empty() ? get_preferred_language() : lang_override;
+        std::string ext = get_extension_for_lang(lang);
+        if (ext.empty()) {
+            std::cerr << "Unsupported language: " << lang << "\n";
+            return;
+        }
+        std::string folder;
+        if (get_solution_folder(slug, folder) != 0) {
+            std::cerr << "Problem not fetched yet. Run: leetcli fetch " << slug << "\n";
+            return;
+        }
+        StartSolutionResult r = write_starter_solution(slug, folder, lang, ext);
+        if (!r.error.empty()) {
+            std::cerr << "Failed to start solution: " << r.error << "\n";
+            return;
+        }
+        std::cout << "✅ Starter code written to " << r.solution_path << "\n";
+    }
+
+    // Renders a percentile "beats X%" line plus a compact text histogram of a
+    // runtime/memory distribution, matching the data the TUI's Submit tab shows.
+    static bool resolve_solution(const std::string& folder, const std::string& lang_override,
+                                 std::string& out_path, std::string& out_lang);
+
+    static void print_distribution(const std::string& label, double percentile,
+                                   const std::vector<DistributionPoint>& dist,
+                                   const std::string& your_bucket) {
+        if (percentile < 0 && dist.empty()) return;
+        std::cout << "\n" << label;
+        if (percentile >= 0) std::cout << " — beats " << percentile << "% of submissions";
+        std::cout << "\n";
+        double max_pct = 0.0;
+        for (const auto& p : dist) max_pct = std::max(max_pct, p.percentage);
+        for (const auto& p : dist) {
+            int bars = (max_pct > 0) ? static_cast<int>((p.percentage / max_pct) * 30 + 0.5) : 0;
+            bool mine = (p.bucket == your_bucket);
+            std::cout << "  " << (mine ? "▶ " : "  ") << std::string(bars, '#')
+                      << "  " << p.bucket << "\n";
         }
     }
 
     void submit_solution(const std::string &slug, const std::string &lang_override) {
-        std::string session = get_session_cookie();
-        std::string csrf = get_csrf_token();
-        // Step 1: Read source code from file
-        std::string solution_path;
-        if (!lang_override.empty()) {
-            get_solution_filepath(slug, solution_path, lang_override);
-        } else {
-            get_solution_filepath(slug, solution_path);
-        }
+        // Resolve folder + solution file (mirrors run_tests / the TUI Submit tab).
+        std::string folder_path;
+        if (get_solution_folder(slug, folder_path) != 0) return;
+        std::string solution_path, lang;
+        if (!resolve_solution(folder_path, lang_override, solution_path, lang)) return;
+
         std::ifstream file(solution_path);
         if (!file) {
-            // std::cerr << "Error: Could not open file " << solution_path << "\n";
+            std::cerr << "Error: Could not open file " << solution_path << "\n";
             return;
         }
-
         std::string code((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
 
-        // Step 2: Query LeetCode to get questionId
-        nlohmann::json query = {
-            {
-                "query", R"(
-                query getQuestionDetail($titleSlug: String!) {
-                    question(titleSlug: $titleSlug) {
-                        questionId
-                    }
-                }
-            )"
-            },
-            {"variables", {{"titleSlug", slug}}}
-        };
-
-        auto resp = cpr::Post(
-            cpr::Url{"https://leetcode.com/graphql"},
-            cpr::Header{{"Content-Type", "application/json"}, {"Cookie", "LEETCODE_SESSION=" + session}},
-            cpr::Body{query.dump()}
-        );
-
-        if (resp.status_code != 200) {
-            std::cerr << "Failed to fetch question ID\n";
+        std::cout << "Submitting your solution...\n";
+        SubmitResult r = submit_and_poll(slug, folder_path, lang, code);
+        if (!r.error.empty()) {
+            std::cerr << "❌ " << r.error << "\n";
+            return;
+        }
+        if (!r.compile_error.empty()) {
+            std::cout << "❌ Compile Error:\n" << r.compile_error << "\n";
             return;
         }
 
-        auto json = nlohmann::json::parse(resp.text);
-        std::string question_id = json["data"]["question"]["questionId"];
-
-        // Step 3: Submit the solution
-        std::string ext = get_file_extension(solution_path);
-        std::string lang;
-        if (ext == "cpp") {
-            lang = "cpp";
-        } else if (ext == "py") {
-            lang = "python3";
-        } else if (ext == "java") {
-            lang = "java";
+        std::cout << "\nResult: " << r.status_msg << "\n";
+        if (r.accepted) {
+            std::cout << "✅ Accepted!\n";
+            if (!r.status_runtime.empty()) std::cout << "Runtime: " << r.status_runtime << "\n";
+            if (!r.status_memory.empty())  std::cout << "Memory:  " << r.status_memory << "\n";
+            print_distribution("Runtime", r.runtime_percentile, r.runtime_distribution, r.status_runtime);
+            print_distribution("Memory",  r.memory_percentile,  r.memory_distribution,  r.status_memory);
         } else {
-            lang = get_preferred_language();
-        }
-        nlohmann::json payload = {
-            {"lang", lang},
-            {"question_id", question_id},
-            {"typed_code", code}
-        };
-
-        auto submit_resp = cpr::Post(
-            cpr::Url{"https://leetcode.com/problems/" + slug + "/submit/"},
-            cpr::Header{
-                {"Content-Type", "application/json"},
-                {"Referer", "https://leetcode.com/problems/" + slug + "/"},
-                {"x-csrftoken", csrf},
-                {"Cookie", "LEETCODE_SESSION=" + session + "; csrftoken=" + csrf}
-            },
-            cpr::Body{payload.dump()}
-        );
-
-        if (submit_resp.status_code != 200) {
-            std::cerr << "Submission failed\n";
-            std::cerr << "Status: " << submit_resp.status_code << "\n";
-            std::cerr << "Response body:\n" << submit_resp.text << "\n";
-            return;
-        }
-
-        // Step 4: Extract submission_id
-        std::string submission_id;
-        try {
-            auto j = nlohmann::json::parse(submit_resp.text);
-            if (j.contains("submission_id")) {
-                submission_id = std::to_string(j["submission_id"].get<int>());
-            } else {
-                std::cerr << "No submission_id in response.\n";
-                std::cerr << "Raw JSON: " << j.dump(2) << "\n";
-                return;
-            }
-        } catch (...) {
-            std::cerr << "Invalid JSON. Raw response:\n" << submit_resp.text << "\n";
-            return;
-        }
-
-        // Step 5: Poll submission result
-        std::cout << "Waiting for result...\n";
-        while (true) {
-            std::this_thread::sleep_for(std::chrono::seconds(2));
-            auto result_resp = cpr::Get(
-                cpr::Url{"https://leetcode.com/submissions/detail/" + submission_id + "/check/"},
-                cpr::Header{{"Cookie", "LEETCODE_SESSION=" + session}}
-            );
-
-            if (result_resp.status_code != 200) {
-                std::cerr << "Failed to poll submission\n";
-                return;
-            }
-
-            auto result_json = nlohmann::json::parse(result_resp.text);
-            // std::cout << result_json;
-            std::string state = result_json["state"];
-            if (state == "SUCCESS") {
-                std::string status_msg = result_json["status_msg"];
-                std::cout << "Result: " << status_msg << "\n";
-
-                if (status_msg == "Accepted") {
-                    std::cout << "✅ Accepted! Runtime: " << result_json["status_runtime"]
-                            << ", Memory: " << result_json["status_memory"] << "\n";
-                } else {
-                    std::cout << "❌ " << status_msg << "\n";
-                    if (result_json.contains("compile_error")) {
-                        std::cout << "Compile Error:\n" << result_json["compile_error"] << "\n";
-                    }
-                    if (result_json.contains("input_formatted"))
-                        std::cout << "Input:            " << result_json["input_formatted"] << "\n";
-
-                    if (result_json.contains("expected_output"))
-                        std::cout << "Expected Output:  " << result_json["expected_output"] << "\n";
-
-                    if (result_json.contains("code_output"))
-                        std::cout << "Your Output:      " << result_json["code_output"] << "\n";
-
-                    if (result_json.contains("total_correct") && result_json.contains("total_testcases"))
-                        std::cout << "Testcases Passed: " << result_json["total_correct"] << " / " << result_json[
-                            "total_testcases"] << "\n";
-
-                    std::cout << "\n🔍 View full details:\n";
-                    std::cout << "   https://leetcode.com/submissions/detail/" << submission_id << "/\n";
-                }
-
-                break;
-            }
+            std::cout << "❌ " << r.status_msg << "\n";
+            if (r.total_testcases > 0)
+                std::cout << "Testcases passed: " << r.total_correct << " / " << r.total_testcases << "\n";
+            if (!r.input_formatted.empty()) std::cout << "Input:           " << r.input_formatted << "\n";
+            if (!r.expected_output.empty()) std::cout << "Expected Output: " << r.expected_output << "\n";
+            if (!r.code_output.empty())     std::cout << "Your Output:     " << r.code_output << "\n";
         }
     }
     RunResult run_against_testcases(const std::string &slug, const std::string &folder,
@@ -967,121 +1002,69 @@ namespace {
         return result;
     }
 
-    void run_problem(const std::string& slug, const std::string& lang, const std::string& question_id,
-        const std::string& code, const std::string& test_input, const std::string& session, const std::string& csrf) {
-        // Submit to LeetCode
-        nlohmann::json body = {
-            {"lang", lang},
-            {"question_id", question_id},
-            {"typed_code", code},
-            {"data_input", test_input}
-        };
-
-        auto url = "https://leetcode.com/problems/" + slug + "/interpret_solution/";
-        cpr::Response r = cpr::Post(
-            cpr::Url{url},
-            cpr::Header{
-                {"Content-Type", "application/json"},
-                {"x-csrftoken", csrf},
-                {"Cookie", "LEETCODE_SESSION=" + session + "; csrftoken=" + csrf},
-                {"Referer", "https://leetcode.com/problems/" + slug + "/"}
-            },
-            cpr::Body{body.dump()}
-        );
-
-        if (r.status_code != 200) {
-            std::cerr << "Run failed: " << r.status_code << "\n" << r.text << std::endl;
-            return;
-        }
-
-        std::string interpret_id = nlohmann::json::parse(r.text)["interpret_id"];
-        std::string check_url = "https://leetcode.com/submissions/detail/" + interpret_id + "/check/";
-        std::cout << "Waiting for result...\n";
-        // Poll for result
-        nlohmann::json result;
-        for (int i = 0; i < 10; ++i) {
-            cpr::Response check = cpr::Get(
-                cpr::Url{check_url},
-                cpr::Header{
-                    {"x-csrftoken", csrf},
-                    {"Cookie", "LEETCODE_SESSION=" + session + "; csrftoken=" + csrf},
-                    {"User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/114.0.0.0 Safari/537.36"},
-                    {"Origin", "https://leetcode.com"},
-                    {"Referer", "https://leetcode.com/problems/" + slug + "/"}
-                }
-            );
-
-            if (check.status_code != 200) {
-                std::cerr << "Polling failed: " << check.status_code << std::endl;
-                return;
-            }
-
-            result = nlohmann::json::parse(check.text);
-            if (result["state"] == "SUCCESS") break;
-
-            std::this_thread::sleep_for(std::chrono::seconds(1));
-        }
-
-        // Pretty-print final result
-        std::cout << "\n≡ƒƒ⌐ Run Result\n";
-        std::cout << "------------------------\n";
-
-        // Always show status
-        std::cout << "Status:        " << result.value("status_msg", "Unknown") << "\n";
-
-        if (result.contains("compile_error") && !result["compile_error"].get<std::string>().empty()) {
-            std::cout << "⛔ Compile Error:\n";
-            std::cout << result["compile_error"].get<std::string>() << "\n";
-            return;
-        }
-
-        if (!result.value("run_success", false)) {
-            std::cout << "⛔ Runtime Error or Submission Failed\n";
-            if (result.contains("std_output_list")) {
-                std::cout << "Output: " << result["std_output_list"] << "\n";
-            }
-            return;
-        }
-
-        if (result.contains("correct_answer") && !result["correct_answer"].is_null()) {
-            std::cout << "Correct:       " << (result["correct_answer"].get<bool>() ? "✅ Yes" : "❌ No") << "\n";
-        } else {
-            std::cout << "Correct:       Unknown\n";
-        }
-
-        if (result.contains("code_answer") && !result["code_answer"].empty()) {
-            std::cout << "Your Output:   " << result["code_answer"][0] << "\n";
-        }
-        if (result.contains("expected_code_answer") && !result["expected_code_answer"].empty()) {
-            std::cout << "Expected:      " << result["expected_code_answer"][0] << "\n";
-        }
-
-        std::cout << "Runtime:       " << result.value("status_runtime", "N/A") << "\n";
-        std::cout << "Memory:        " << result.value("status_memory", "N/A") << "\n";
-        std::cout << "Language:      " << result.value("pretty_lang", lang) << "\n";
-    }
-    void run_tests(const std::string& slug, const std::string &lang_override) {
-        // Detect file
-        std::string folder_path;
-        get_solution_folder(slug, folder_path);
-        std::string solution_path;
+    // Picks the solution file to run/submit inside `folder` and its langSlug.
+    // With an explicit lang, requires that language's solution.<ext>.
+    // Otherwise auto-detects the existing solution.<ext> — preferring the
+    // configured default language, then falling back to whichever one is
+    // present — the same "derive lang from the file that exists" behaviour the
+    // TUI uses, so you don't have to pass --lang matching your config.
+    // Returns false (after printing why) if nothing usable is found.
+    static bool resolve_solution(const std::string& folder, const std::string& lang_override,
+                                 std::string& out_path, std::string& out_lang) {
         if (!lang_override.empty()) {
-            get_solution_filepath(slug, solution_path, lang_override);
-        } else {
-            get_solution_filepath(slug, solution_path);
+            std::string ext = get_extension_for_lang(lang_override);
+            if (ext.empty()) {
+                std::cerr << "Unsupported language: " << lang_override << "\n";
+                return false;
+            }
+            std::string path = folder + "/solution" + ext;
+            if (!std::filesystem::exists(path)) {
+                std::cerr << "No solution" << ext << " in " << folder
+                          << " — run: leetcli start <slug> --lang=" << lang_override << "\n";
+                return false;
+            }
+            out_path = path;
+            out_lang = lang_override;
+            return true;
         }
-        std::string ext = get_file_extension(solution_path);
-        std::string lang;
-        if (ext == "cpp") {
-            lang = "cpp";
-        } else if (ext == "py") {
-            lang = "python3";
-        } else if (ext  ==  "java") {
-            lang = "java";
-        } else {
-            std::cerr << "No solution file found.\n";
-            return;
+
+        std::vector<std::string> found;
+        std::error_code ec;
+        for (const auto& e : std::filesystem::directory_iterator(folder, ec))
+            if (e.path().filename().string().rfind("solution.", 0) == 0)
+                found.push_back(e.path().string());
+        if (found.empty()) {
+            std::cerr << "No solution file found in " << folder
+                      << " — run: leetcli start <slug>\n";
+            return false;
         }
+
+        // Prefer the configured default language if that file is present.
+        std::string pref_ext = get_extension_for_lang(get_preferred_language());
+        for (const auto& f : found) {
+            if (!pref_ext.empty() && f.size() >= pref_ext.size() &&
+                f.compare(f.size() - pref_ext.size(), pref_ext.size(), pref_ext) == 0) {
+                out_path = f;
+                out_lang = get_preferred_language();
+                return true;
+            }
+        }
+        // Otherwise take whichever solution file exists.
+        out_path = found.front();
+        out_lang = get_lang_for_extension(get_file_extension(found.front()));
+        if (out_lang.empty()) {
+            std::cerr << "Could not determine language for " << found.front() << "\n";
+            return false;
+        }
+        return true;
+    }
+
+    void run_tests(const std::string& slug, const std::string &lang_override) {
+        // Detect folder + solution file
+        std::string folder_path;
+        if (get_solution_folder(slug, folder_path) != 0) return;
+        std::string solution_path, lang;
+        if (!resolve_solution(folder_path, lang_override, solution_path, lang)) return;
 
         std::ifstream file(solution_path);
         if (!file) {
@@ -1090,19 +1073,31 @@ namespace {
         }
         std::string code((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
 
-        // Load tokens
-        std::string session = get_session_cookie();
-        std::string csrf = get_csrf_token();
-        std::string question_id = get_question_id(slug, session, csrf);
+        std::cout << "Running your solution against example testcases...\n";
+        RunResult r = run_against_testcases(slug, folder_path, lang, code);
+        if (!r.error.empty()) {
+            std::cerr << "❌ " << r.error << "\n";
+            return;
+        }
+        if (!r.compile_error.empty()) {
+            std::cout << "❌ Compile Error:\n" << r.compile_error << "\n";
+            return;
+        }
 
-        std::vector<std::string> cases = load_testcases(folder_path + "/" + "testcases.txt");
-        std::cout << "Running " << cases.size() << " testcases..." << std::endl;
-        for (const std::string& test : cases) {
-            std::cout << "Testcase:\n" << test << "\n---\n";
-            run_problem(slug, lang, question_id, code, test, session, csrf);
+        std::cout << "\nResult: " << r.status_msg << "\n";
+        if (!r.status_runtime.empty()) std::cout << "Runtime: " << r.status_runtime << "\n";
+        if (!r.status_memory.empty())  std::cout << "Memory:  " << r.status_memory << "\n";
+        if (!r.runtime_error.empty())  std::cout << "\nRuntime Error:\n" << r.runtime_error << "\n";
 
-            // Add delay between submissions to avoid rate limiting
-            std::this_thread::sleep_for(std::chrono::seconds(5));
+        int passed = 0;
+        for (const auto& tc : r.testcases) if (tc.passed) ++passed;
+        std::cout << "\nTestcases passed: " << passed << " / " << r.testcases.size() << "\n";
+        for (size_t i = 0; i < r.testcases.size(); ++i) {
+            const auto& tc = r.testcases[i];
+            std::cout << "\n" << (tc.passed ? "✅" : "❌") << " Testcase " << (i + 1) << "\n";
+            std::cout << "  Input:    " << tc.input << "\n";
+            std::cout << "  Expected: " << tc.expected << "\n";
+            std::cout << "  Got:      " << tc.actual << "\n";
         }
     }
     TopicsHintsResult fetch_topics_and_hints(const std::string &slug) {

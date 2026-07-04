@@ -41,6 +41,11 @@ namespace leetcli {
     std::string get_gemini_key();
     static std::filesystem::path get_home();
     std::string get_file_extension(const std::string& filename);
+    // langSlug -> file extension (with leading dot, e.g. "cpp" -> ".cpp") and
+    // the inverse. Covers the same 18 languages as the TUI's kLangOptions.
+    // Returns "" for an unknown language/extension.
+    std::string get_extension_for_lang(const std::string& lang);
+    std::string get_lang_for_extension(const std::string& ext);
     void init_problems_folder();
     std::string html_to_text(const std::string& html);
     // Parses LeetCode problem-description HTML into richly-styled ftxui
@@ -97,6 +102,11 @@ namespace leetcli {
     // set_session_cookie(), used by the TUI's onboarding wizard after its
     // own login-form UI has collected the values.
     void save_session_tokens(const std::string& session, const std::string& csrf);
+    // Merge-write a single config.json field (used by the CLI `config`
+    // subcommands, mirroring set_editor_preference/set_gemini_key).
+    void set_language_preference(const std::string& lang);
+    void set_problems_dir(const std::string& dir);
+    void set_image_rendering_pref(const std::string& mode);
     void set_session_cookie();
     std::string get_session_cookie();
     std::string get_csrf_token();
